@@ -1,7 +1,7 @@
 __pycache__/
 .pic/
+.task/
 annie/
-unneeded/
 apikey.py
 bot_mem.md
 current_state.md
