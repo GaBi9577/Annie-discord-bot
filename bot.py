@@ -2,6 +2,7 @@ import discord
 import asyncio
 import base64
 import io
+import random
 import requests
 from datetime import datetime
 from openai import OpenAI
@@ -31,6 +32,8 @@ pending = {}              # user_id -> asyncio.Task（計時器，debounce 或�
 pending_mode = {}         # user_id -> "debounce" | "waiting"（目前計時器屬於哪種模式）
 pending_buffer = {}       # user_id -> list[str]（等待期間收到的訊息，等等會合併）
 conversation_history = {}  # user_id -> list[{"role": ..., "content": ...}]（短期記憶）
+last_interaction_time = {}  # user_id -> datetime（最後一次互動時間，使用者發訊或她主動發訊都算，主動發訊判斷用）
+last_channel = {}           # user_id -> discord 頻道物件（記錄最後互動頻道，主動發訊要送去哪裡）
 
 
 def load_bot_memory():
@@ -124,9 +127,11 @@ def build_user_content(text, image_urls):
     return content
 
 
-def build_messages(user_id, user_content, catch_up_note=None):
-    """組出這次要送給 API 的 messages：角色人設 + 長期記憶 + 現況小抄 + 時間感知 + 短期歷史 + 這次的訊息"""
-    history = conversation_history.setdefault(user_id, [])
+def build_base_system_messages(now):
+    """組出人設 + 長期記憶 + 現況小抄 + 時間感知這四段共通的 system messages。
+    正常回覆跟主動發訊檢查都需要這一段，抽出來避免重複（DRY）。
+    回傳 (messages, status)，status 是 get_schedule_status() 的結果，呼叫端可能還需要用到。
+    """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if bot_memory:
         messages.append({
@@ -138,7 +143,6 @@ def build_messages(user_id, user_content, catch_up_note=None):
         "content": f"【目前持續中的狀態】\n{current_state}"
     })
 
-    now = datetime.now()
     status = get_schedule_status(now)
     messages.append({
         "role": "system",
@@ -148,11 +152,12 @@ def build_messages(user_id, user_content, catch_up_note=None):
             "回覆的語氣長短可以自然反映這個時段的狀態，不用刻意提起。"
         )
     })
+    return messages, status
 
-    if catch_up_note:
-        messages.append({"role": "system", "content": catch_up_note})
 
-    messages.append({
+def output_format_system_message():
+    """輸出格式技術規定：現況小抄 + 圖片 prompt 的分隔線說明。正常回覆跟主動發訊檢查共用。"""
+    return {
         "role": "system",
         "content": (
             "【輸出格式技術規定，此段不屬於角色設定】\n"
@@ -179,9 +184,43 @@ def build_messages(user_id, user_content, catch_up_note=None):
             "每個面向都要有具體內容，不要籠統帶過。不想分享照片就不要加這一段。\n"
             "以上這些技術段落使用者都看不到，不用顧慮角色語氣，直接客觀描述即可。"
         )
-    })
+    }
+
+
+def build_messages(user_id, user_content, catch_up_note=None):
+    """組出這次要送給 API 的 messages：角色人設 + 長期記憶 + 現況小抄 + 時間感知 + 短期歷史 + 這次的訊息"""
+    history = conversation_history.setdefault(user_id, [])
+    messages, _ = build_base_system_messages(datetime.now())
+
+    if catch_up_note:
+        messages.append({"role": "system", "content": catch_up_note})
+
+    messages.append(output_format_system_message())
     messages.extend(history)
     messages.append({"role": "user", "content": user_content})
+    return messages
+
+
+def build_proactive_check_messages(user_id):
+    """組出「主動發訊檢查」用的 messages：跟正常回覆共用人設/記憶/狀態/時間感知，
+    但沒有使用者這輪的訊息，改成一段系統說明，讓她自己判斷這個當下想不想主動開口。
+    """
+    history = conversation_history.setdefault(user_id, [])
+    messages, _ = build_base_system_messages(datetime.now())
+
+    messages.append({
+        "role": "system",
+        "content": (
+            "【系統定期檢查，不是使用者傳來的訊息】\n"
+            "現在沒有新訊息，這是系統定期檢查你想不想主動開口。"
+            "根據你目前的狀態、心情、跟對方的關係，自己判斷這個當下想不想主動傳訊息給翔。\n"
+            f"如果不想，只需要回覆「{NO_PROACTIVE_TOKEN}」這幾個字，不要輸出其他任何內容。\n"
+            "如果想，才需要照平常的格式輸出：你想說的話，然後接著照樣附上現況小抄"
+            "（格式規定跟平常一樣，見下一段技術規定）。"
+        )
+    })
+    messages.append(output_format_system_message())
+    messages.extend(history)
     return messages
 
 
@@ -248,9 +287,13 @@ def strip_images_for_history(content):
 
 
 def update_history(user_id, user_content, reply_content):
-    """把這一輪對話存入短期歷史，超過上限的部分交給長期記憶整理後砍掉"""
+    """把這一輪對話存入短期歷史，超過上限的部分交給長期記憶整理後砍掉。
+    user_content 為 None 時代表這輪是主動發訊（沒有對應的使用者訊息），只存 assistant 這一半，
+    不要塞一句假的 user 發言進去污染歷史紀錄。
+    """
     history = conversation_history.setdefault(user_id, [])
-    history.append({"role": "user", "content": strip_images_for_history(user_content)})
+    if user_content is not None:
+        history.append({"role": "user", "content": strip_images_for_history(user_content)})
     history.append({"role": "assistant", "content": reply_content})
     if len(history) > MAX_HISTORY_MESSAGES:
         overflow_count = len(history) - MAX_HISTORY_MESSAGES
@@ -311,6 +354,7 @@ async def update_bot_memory(overflow_messages):
 @client.event
 async def on_ready():
     print(f"Bot 已上線：{client.user}")
+    client.loop.create_task(proactive_loop())
 
 
 @client.event
@@ -319,6 +363,7 @@ async def on_message(message):
         return
 
     user_id = message.author.id
+    last_channel[user_id] = message.channel
 
     pending_buffer.setdefault(user_id, []).append({
         "text": message.content,
@@ -403,8 +448,93 @@ async def wait_then_reply(user_id, message, wait_seconds, busy_reason=None, busy
         print("警告：模型沒有依格式輸出現況小抄，本輪狀態維持不變")
 
     update_history(user_id, user_content, reply_text)
+    last_interaction_time[user_id] = datetime.now()
     pending.pop(user_id, None)
     pending_mode.pop(user_id, None)
+
+
+def should_attempt_proactive(user_id, now):
+    """第一關：便宜的過濾器（不呼叫 LLM），決定這次要不要花錢問她真正的意願。
+    距離上次互動太近就不考慮；過了安全時間後，閒置越久機率越高，但有上限。
+    """
+    last_time = last_interaction_time.get(user_id)
+    if last_time is None:
+        return False  # 還沒有任何互動紀錄，不主動
+
+    elapsed_minutes = (now - last_time).total_seconds() / 60
+    if elapsed_minutes < PROACTIVE_MIN_QUIET_MINUTES:
+        return False
+
+    elapsed_hours = elapsed_minutes / 60
+    probability = min(
+        PROACTIVE_GATE_MAX_PROBABILITY,
+        PROACTIVE_GATE_BASE_PROBABILITY + elapsed_hours * PROACTIVE_GATE_GROWTH_PER_HOUR,
+    )
+    return random.random() < probability
+
+
+async def attempt_proactive_message(user_id):
+    """第二關：真的呼叫 LLM，讓她根據狀態/長期記憶/時段判斷這次要不要主動傳訊息、傳什麼"""
+    global current_state
+
+    channel = last_channel.get(user_id)
+    if channel is None:
+        return  # 還沒有已知的頻道可以送，跳過
+
+    if user_id in pending:
+        return  # 使用者訊息正在處理中（debounce 或等待忙碌時段結束），這輪不搶著發
+
+    response = await asyncio.to_thread(
+        llm_client.chat.completions.create,
+        model=MODEL,
+        messages=build_proactive_check_messages(user_id),
+    )
+    raw_text = response.choices[0].message.content.strip()
+
+    if raw_text == NO_PROACTIVE_TOKEN or raw_text.startswith(NO_PROACTIVE_TOKEN):
+        return  # 她這次判斷不想主動開口，不用做任何事
+
+    reply_text, updated_state, image_prompt = split_model_output(raw_text)
+    if not reply_text:
+        return
+
+    image_bytes = None
+    if image_prompt:
+        image_bytes = await generate_image(image_prompt)
+
+    print("主動發訊：", reply_text)
+    if image_bytes:
+        discord_file = discord.File(io.BytesIO(image_bytes), filename="annie.png")
+        await channel.send(content=reply_text, file=discord_file)
+    else:
+        await channel.send(reply_text)
+
+    if updated_state:
+        current_state = updated_state
+        with open(CURRENT_STATE_PATH, "w", encoding="utf-8") as f:
+            f.write(updated_state)
+
+    update_history(user_id, None, reply_text)
+    last_interaction_time[user_id] = datetime.now()
+
+
+async def proactive_loop():
+    """背景迴圈：每隔一段隨機時間醒來檢查一次，決定要不要主動傳訊息（bot 主控性核心）"""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        wait_minutes = random.uniform(
+            PROACTIVE_CHECK_INTERVAL_MIN_MINUTES, PROACTIVE_CHECK_INTERVAL_MAX_MINUTES
+        )
+        await asyncio.sleep(wait_minutes * 60)
+
+        now = datetime.now()
+        status = get_schedule_status(now)
+        if status["blocking"]:
+            continue  # 睡覺／健身時段不主動；其他時段（含上課中）都可能觸發
+
+        for user_id in list(last_channel.keys()):
+            if should_attempt_proactive(user_id, now):
+                await attempt_proactive_message(user_id)
 
 
 async def flush_remaining_history():

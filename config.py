@@ -59,6 +59,16 @@ IMAGE_MODEL = image_model  # 模型 ID 請對照 NanoGPT 圖片模型列表確�
 IMAGE_RESOLUTION = "1088x1920"  # 對應 9:16 直式構圖，用 API 參數硬性指定，比純文字提示可靠
 IMAGE_DELIMITER = "\n===IMAGE===\n"  # 用來從模型輸出切出圖片生成 prompt(可選段落)
 
+# --- 主動發訊(bot 主控性，不需使用者輸入也能主動開口)---
+# 兩階段判斷：第一關(便宜，不呼叫 LLM)先用機率過濾，過關才呼叫 LLM 問她真正的意願
+PROACTIVE_CHECK_INTERVAL_MIN_MINUTES = 30  # 每次檢查間隔下限(隨機，避免太規律)
+PROACTIVE_CHECK_INTERVAL_MAX_MINUTES = 60  # 每次檢查間隔上限
+PROACTIVE_MIN_QUIET_MINUTES = 20           # 距離上次互動(使用者發訊或她主動發訊都算)至少要這麼久，才考慮主動發訊
+PROACTIVE_GATE_BASE_PROBABILITY = 0.15     # 第一關基礎機率(剛過最短安靜時間時)
+PROACTIVE_GATE_MAX_PROBABILITY = 0.6       # 第一關機率上限(閒置越久機率越高，但封頂)
+PROACTIVE_GATE_GROWTH_PER_HOUR = 0.15      # 每多閒置一小時，機率增加多少
+NO_PROACTIVE_TOKEN = "NO_PROACTIVE"        # LLM 判斷這次不想主動發訊時，固定回覆這串字
+
 
 
 
