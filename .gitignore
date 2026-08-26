@@ -1,0 +1,8 @@
+__pycache__/
+.pic/
+annie/
+unneeded/
+apikey.py
+bot_mem.md
+current_state.md
+project.md
