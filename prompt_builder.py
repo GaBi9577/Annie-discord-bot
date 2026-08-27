@@ -1,0 +1,150 @@
+"""
+Prompt 組裝：載入人設檔案，組出每次呼叫 API 要用的完整 messages。
+
+拆成 build_base_system_messages()（人設＋長期記憶＋現況小抄＋時間感知）與
+output_format_system_message()（輸出格式技術規定），供正常回覆與未來的主動發訊
+共用同一套組裝邏輯（DRY）。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+import config
+from schedule import WEEKDAY_NAMES, get_schedule_status, now_taipei
+
+
+def _load_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def load_system_prompt() -> str:
+    persona = _load_text(config.SYSTEM_PROMPT_PATH)
+    few_shot = _load_text(config.FEW_SHOT_PATH)
+    return persona + "\n\n" + few_shot
+
+
+def load_pic_prompt_prefix() -> str:
+    return _load_text(config.PIC_PROMPT_PATH).strip()
+
+
+SYSTEM_PROMPT = load_system_prompt()
+
+_OUTPUT_FORMAT_INSTRUCTIONS = (
+    "【輸出格式技術規定，此段不屬於角色設定】\n"
+    f"正常回覆完之後，換行加上分隔線「{config.STATE_DELIMITER.strip()}」，"
+    "接著用旁白角度簡短描述回覆後「會持續到下一輪對話仍然成立」的狀態"
+    "（例如：正在做的事、身體狀態如頭髮還沒吹乾、情緒是否還沒平復及原因等）。"
+    "只描述會延續下去的狀態，不要重複列出這輪講過的對話內容，"
+    "如果沒有需要更新的狀態就照抄前一版的【目前持續中的狀態】內容。\n"
+    "如果這一輪你判斷想主動分享一張照片給對方看（例如聊到你正在做的事、"
+    "想讓對方看看你現在的樣子，不需要每輪都分享），"
+    f"在狀態段落後面再換行加上「{config.IMAGE_DELIMITER.strip()}」，"
+    "接著用英文寫這張照片的 prompt，這是給圖片生成模型用的，不是講給使用者聽的話。"
+    "角色身分與畫風不用你描述，程式會自動加上，"
+    "你只需要依照這次場景自由決定並描述以下六個面向，"
+    "全部合併成一段逗號分隔的描述，不要加類別標籤：\n"
+    "1. Clothing（服裝：款式、顏色、材質）\n"
+    "2. Action（動作：姿勢、肢體、手部動作、視線方向）\n"
+    "3. Expression（表情：情緒、細微表情特徵）\n"
+    "4. Environment Background（背景：場景、環境細節、景深）\n"
+    "5. Lighting Atmosphere（光線：光源方向、光影對比、氛圍）\n"
+    "6. Composition and Camera（構圖與運鏡：拍攝距離如全身／半身／特寫、"
+    "拍攝角度如平視／俯角／仰角、視角如第一人稱自拍或第三人稱旁觀，"
+    "依照這次想呈現的場景自由決定，不要每次都套用同一種構圖）\n"
+    "每個面向都要有具體內容，不要籠統帶過。不想分享照片就不要加這一段。\n"
+    "以上這些技術段落使用者都看不到，不用顧慮角色語氣，直接客觀描述即可。"
+)
+
+
+def build_user_content(text: str, image_urls: list[str]):
+    """組出這一輪 user 訊息的 content：純文字就用字串，有圖片就用 array 格式。"""
+    if not image_urls:
+        return text
+
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    for url in image_urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    return content
+
+
+def build_base_system_messages(
+    bot_memory: str, current_state: str, now: datetime | None = None
+) -> list[dict]:
+    """人設 + 長期記憶 + 現況小抄 + 時間感知，供正常回覆與主動發訊共用。"""
+    now = now or now_taipei()
+    status = get_schedule_status(now)
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    if bot_memory:
+        messages.append({
+            "role": "system",
+            "content": f"【關於使用者與過往互動的長期記憶】\n{bot_memory}",
+        })
+
+    messages.append({
+        "role": "system",
+        "content": f"【目前持續中的狀態】\n{current_state}",
+    })
+
+    messages.append({
+        "role": "system",
+        "content": (
+            f"【目前時間感知】現在是{WEEKDAY_NAMES[now.weekday()]} {now.strftime('%H:%M')}，"
+            f"依照平常作息，這個時段通常是：{status.label}。"
+            "回覆的語氣長短可以自然反映這個時段的狀態，不用刻意提起。"
+        ),
+    })
+
+    return messages
+
+
+def output_format_system_message() -> dict:
+    return {"role": "system", "content": _OUTPUT_FORMAT_INSTRUCTIONS}
+
+
+def build_messages(
+    history: list[dict],
+    bot_memory: str,
+    current_state: str,
+    user_content,
+    catch_up_note: str | None = None,
+) -> list[dict]:
+    """組出這次要送給 API 的完整 messages：base system + catch-up + 輸出格式 + 歷史 + 這輪訊息。"""
+    messages = build_base_system_messages(bot_memory, current_state)
+
+    if catch_up_note:
+        messages.append({"role": "system", "content": catch_up_note})
+
+    messages.append(output_format_system_message())
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_content})
+    return messages
+
+
+def build_proactive_check_messages(
+    history: list[dict], bot_memory: str, current_state: str, now: datetime | None = None
+) -> list[dict]:
+    """組出「主動發訊檢查」用的 messages：跟正常回覆共用人設/記憶/狀態/時間感知，
+    但沒有使用者這輪的訊息，改成一段系統說明，讓她自己判斷這個當下想不想主動開口。
+    """
+    messages = build_base_system_messages(bot_memory, current_state, now)
+
+    messages.append({
+        "role": "system",
+        "content": (
+            "【系統定期檢查，不是使用者傳來的訊息】\n"
+            "現在沒有新訊息，這是系統定期檢查你想不想主動開口。"
+            "根據你目前的狀態、心情、跟對方的關係，自己判斷這個當下想不想主動傳訊息給翔。\n"
+            f"如果不想，只需要回覆「{config.NO_PROACTIVE_TOKEN}」這幾個字，不要輸出其他任何內容。\n"
+            "如果想，才需要照平常的格式輸出：你想說的話，然後接著照樣附上現況小抄"
+            "（格式規定跟平常一樣，見下一段技術規定）。"
+        ),
+    })
+    messages.append(output_format_system_message())
+    messages.extend(history)
+    return messages

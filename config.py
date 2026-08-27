@@ -8,8 +8,8 @@ from apikey import TOKEN, NANOGPT_API_KEY
 # ----- 方便調參用(模型) -----
 
 text_model = "x-ai/grok-4.5"
-img_model_list = ["wai-illustrious-sdxl", "nsfw-gen-illustrious", 
-                  "persona:376130@2456367", "infinite-illustrious", 
+img_model_list = ["wai-illustrious-sdxl", "nsfw-gen-illustrious",
+                  "persona:376130@2456367", "infinite-illustrious",
                   "animagine-xl-31", "crystal-clear-xl"]
 
 image_model = img_model_list[0]
@@ -33,8 +33,8 @@ PIC_PROMPT_PATH = "annie/pic_prompt.md"  # 外觀描述(圖片生成用)加在�
 FEW_SHOT_PATH = "annie/few_shot.md"
 
 # --- 記憶 ---
-MAX_HISTORY_MESSAGES = 10  
-BOT_MEMORY_PATH = "bot_mem.md"  
+MAX_HISTORY_MESSAGES = 10
+BOT_MEMORY_PATH = "bot_mem.md"
 # 長期記憶檔案，由 bot 自動整理與更新
 # 短期記憶則數上限(user+assistant 合計，約 4 輪)
 # 超過的部分會自動整理進 bot_mem.md 再從短期記憶砍掉
@@ -68,9 +68,3 @@ PROACTIVE_GATE_BASE_PROBABILITY = 0.15     # 第一關基礎機率(剛過最短�
 PROACTIVE_GATE_MAX_PROBABILITY = 0.6       # 第一關機率上限(閒置越久機率越高，但封頂)
 PROACTIVE_GATE_GROWTH_PER_HOUR = 0.15      # 每多閒置一小時，機率增加多少
 NO_PROACTIVE_TOKEN = "NO_PROACTIVE"        # LLM 判斷這次不想主動發訊時，固定回覆這串字
-
-
-
-
-
-
