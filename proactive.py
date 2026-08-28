@@ -24,7 +24,7 @@ import config
 from schedule import get_schedule_status, now_taipei
 from prompt_builder import build_proactive_check_messages
 from llm_client import chat_completion
-from response_parser import split_model_output
+from response_parser import parse_response, RESPONSE_JSON_SCHEMA
 from image_gen import generate_image
 
 logger = logging.getLogger(__name__)
@@ -65,15 +65,16 @@ async def attempt_proactive_message(user_id, session, memory_manager, state_hold
     )
 
     try:
-        raw_text = (await chat_completion(messages)).strip()
+        raw_text = await chat_completion(messages, response_format=RESPONSE_JSON_SCHEMA)
     except Exception:
         logger.exception("主動發訊檢查呼叫 LLM 失敗")
         return
 
-    if raw_text == config.NO_PROACTIVE_TOKEN or raw_text.startswith(config.NO_PROACTIVE_TOKEN):
+    parsed = parse_response(raw_text)
+
+    if parsed.reply == config.NO_PROACTIVE_TOKEN or parsed.reply.startswith(config.NO_PROACTIVE_TOKEN):
         return  # 她這次判斷不想主動開口，不用做任何事
 
-    parsed = split_model_output(raw_text)
     if not parsed.reply:
         return
 

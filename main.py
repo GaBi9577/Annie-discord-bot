@@ -19,7 +19,7 @@ from schedule import get_schedule_status, format_elapsed, now_taipei
 from session import SessionManager
 from prompt_builder import build_user_content, build_messages
 from llm_client import chat_completion
-from response_parser import split_model_output
+from response_parser import parse_response, RESPONSE_JSON_SCHEMA
 from image_gen import generate_image
 from memory import MemoryManager
 from state import CurrentStateHolder
@@ -130,14 +130,14 @@ async def wait_then_reply(
 
     async with message.channel.typing():
         try:
-            raw_text = await chat_completion(messages)
+            raw_text = await chat_completion(messages, response_format=RESPONSE_JSON_SCHEMA)
         except Exception:
             logger.exception("LLM 呼叫最終失敗")
             await message.channel.send("（訊號有點不穩，等一下再試一次）")
             session.clear_pending()
             return
 
-    parsed = split_model_output(raw_text)
+    parsed = parse_response(raw_text)
 
     image_bytes = None
     if parsed.image_prompt:

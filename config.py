@@ -3,7 +3,7 @@
 # 一般設定與參數，不含實際敏感值，可自由分享
 # 敏感值（Token、API Key）在 apikey.py，那個檔案禁止分享
 
-from apikey import TOKEN, NANOGPT_API_KEY
+from apikey import TOKEN, NANOGPT_API_KEY, PIXAI_API_KEY
 
 # ----- 方便調參用(模型) -----
 
@@ -41,7 +41,6 @@ BOT_MEMORY_PATH = "bot_mem.md"
 # 數字大小請憑實測手感調整，不用算得太精確
 
 CURRENT_STATE_PATH = "current_state.md"  # 現況小抄：短期內持續變動的狀態(情緒/動作/身體狀態等)
-STATE_DELIMITER = "\n===STATE===\n"      # 用來從模型輸出切開「回覆」與「更新後的現況小抄」
 
 # --- 對話行為 ---
 REPLY_DELAY = 2  # 秒，訊息緩衝等待時間
@@ -53,11 +52,21 @@ GYM_START_HOUR = 17     # 健身開始
 GYM_END_HOUR = 19       # 健身結束(17-19 點健身時段內不回訊息)
 
 
+# --- 圖片生成 provider 選擇 ---
+IMAGE_PROVIDER = "nanogpt"  # "nanogpt" | "pixai"，要切換就改這個值，呼叫端程式碼不用動
+
 # --- 圖片生成(NanoGPT，備案為本機 SDXL Turbo，待筆電空間足夠再切換)---
 NANOGPT_IMAGE_URL = "https://nano-gpt.com/v1/images/generations"
 IMAGE_MODEL = image_model  # 模型 ID 請對照 NanoGPT 圖片模型列表確認
 IMAGE_RESOLUTION = "1088x1920"  # 對應 9:16 直式構圖，用 API 參數硬性指定，比純文字提示可靠
-IMAGE_DELIMITER = "\n===IMAGE===\n"  # 用來從模型輸出切出圖片生成 prompt(可選段落)
+
+# --- 圖片生成(PixAI，v2 image API，task-based：建立任務→輪詢→下載)---
+PIXAI_BASE_URL = "https://api.pixai.art"
+PIXAI_MODEL_VERSION_ID = "REPLACE_ME"  # 到 PixAI 網站該模型版本頁面的網址複製最後一段路徑
+PIXAI_ASPECT_RATIO = "9:16"
+PIXAI_MODE = "standard"  # lite/standard/pro/ultra，僅 Tsubaki.2 系列模型有效，其他模型忽略此參數
+PIXAI_POLL_INTERVAL_SECONDS = 2   # 每隔幾秒查一次任務狀態
+PIXAI_POLL_TIMEOUT_SECONDS = 90   # 輪詢逾時上限，超過就當作失敗
 
 # --- 主動發訊(bot 主控性，不需使用者輸入也能主動開口)---
 # 兩階段判斷：第一關(便宜，不呼叫 LLM)先用機率過濾，過關才呼叫 LLM 問她真正的意願

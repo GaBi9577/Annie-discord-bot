@@ -40,10 +40,18 @@ def _is_retryable(exc: Exception) -> bool:
     return False
 
 
-async def chat_completion(messages: list[dict], model: str | None = None) -> str:
-    """呼叫 chat completion。transient error 會自動重試，最終失敗才把例外往上拋。"""
+async def chat_completion(
+    messages: list[dict], model: str | None = None, response_format: dict | None = None
+) -> str:
+    """呼叫 chat completion。transient error 會自動重試，最終失敗才把例外往上拋。
+
+    response_format 可傳入 OpenAI-compatible 的 json_schema 設定，強制模型輸出
+    符合指定結構的 JSON（NanoGPT 的 chat/completions endpoint 有支援 constrained
+    decoding），不需要另外處理則留 None，行為跟以前一樣。
+    """
     model = model or config.MODEL
     last_exc: Exception | None = None
+    extra_kwargs = {"response_format": response_format} if response_format else {}
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -52,6 +60,7 @@ async def chat_completion(messages: list[dict], model: str | None = None) -> str
                 model=model,
                 messages=messages,
                 timeout=REQUEST_TIMEOUT_SECONDS,
+                **extra_kwargs,
             )
             return response.choices[0].message.content
         except Exception as exc:

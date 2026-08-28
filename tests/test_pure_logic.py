@@ -3,6 +3,7 @@
 涵蓋 schedule 邊界、模型輸出解析、時間差格式化。
 """
 
+import json
 import random
 import sys
 from datetime import datetime
@@ -12,7 +13,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config
-from response_parser import split_model_output
+from response_parser import parse_response
 from schedule import format_elapsed, get_schedule_status
 from session import UserSession
 from proactive import should_attempt_proactive
@@ -87,35 +88,57 @@ class TestFormatElapsed:
         assert format_elapsed(start, end) == "2小時30分鐘"
 
 
-class TestSplitModelOutput:
-    def test_no_delimiter_returns_raw_text_as_reply(self):
-        result = split_model_output("單純的回覆內容")
-        assert result.reply == "單純的回覆內容"
-        assert result.state is None
-        assert result.image_prompt is None
-
-    def test_reply_and_state(self):
-        raw = "今天過得不錯\n===STATE===\n心情平靜，剛洗完澡"
-        result = split_model_output(raw)
+class TestParseResponse:
+    def test_normal_response(self):
+        raw = json.dumps({
+            "reply": "今天過得不錯",
+            "state": "心情平靜，剛洗完澡",
+            "image_prompt": None,
+        })
+        result = parse_response(raw)
         assert result.reply == "今天過得不錯"
         assert result.state == "心情平靜，剛洗完澡"
         assert result.image_prompt is None
 
-    def test_reply_state_and_image_prompt(self):
-        raw = (
-            "傳張照片給你看\n===STATE===\n剛拍完照，心情不錯"
-            "\n===IMAGE===\ncasual outfit, smiling, indoor, soft lighting, close-up"
-        )
-        result = split_model_output(raw)
+    def test_response_with_image_prompt(self):
+        raw = json.dumps({
+            "reply": "傳張照片給你看",
+            "state": "剛拍完照，心情不錯",
+            "image_prompt": "casual outfit, smiling, indoor, soft lighting, close-up",
+        })
+        result = parse_response(raw)
         assert result.reply == "傳張照片給你看"
         assert result.state == "剛拍完照，心情不錯"
         assert result.image_prompt == "casual outfit, smiling, indoor, soft lighting, close-up"
 
+    def test_empty_state_string_becomes_none(self):
+        raw = json.dumps({"reply": "回覆內容", "state": "", "image_prompt": None})
+        result = parse_response(raw)
+        assert result.state is None
+
     def test_strips_whitespace(self):
-        raw = "  回覆內容  \n===STATE===\n  狀態內容  "
-        result = split_model_output(raw)
+        raw = json.dumps({
+            "reply": "  回覆內容  ",
+            "state": "  狀態內容  ",
+            "image_prompt": None,
+        })
+        result = parse_response(raw)
         assert result.reply == "回覆內容"
         assert result.state == "狀態內容"
+
+    def test_malformed_json_falls_back_to_raw_text_as_reply(self):
+        raw = "不是合法 JSON 的原始文字"
+        result = parse_response(raw)
+        assert result.reply == "不是合法 JSON 的原始文字"
+        assert result.state is None
+        assert result.image_prompt is None
+
+    def test_missing_fields_do_not_crash(self):
+        raw = json.dumps({"reply": "只有 reply 欄位"})
+        result = parse_response(raw)
+        assert result.reply == "只有 reply 欄位"
+        assert result.state is None
+        assert result.image_prompt is None
 
 
 class TestShouldAttemptProactive:
