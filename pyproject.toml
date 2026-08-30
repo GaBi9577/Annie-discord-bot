@@ -1,0 +1,18 @@
+[project]
+name = "annie-discord-bot"
+version = "0.1.0"
+description = "單一使用者的個人 Discord Bot，角色為《進擊的巨人》亞妮·雷恩哈特，以同居設定互動。"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.4",
+    "openai>=1.40",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
