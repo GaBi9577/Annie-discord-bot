@@ -18,6 +18,7 @@ from response_parser import parse_response
 from schedule import format_elapsed, get_schedule_status
 from session import UserSession
 from proactive import should_attempt_proactive, attempt_proactive_message
+from memory import MemoryManager
 
 TZ = ZoneInfo("Asia/Taipei")
 
@@ -279,3 +280,86 @@ class TestAttemptProactiveMessageSendFailure:
         assert session.last_channel.send_calls == 1
         assert state_holder.update_calls == 1
         assert memory_manager.append_turn_calls == 1
+
+
+class TestMemoryManagerQueueSerialization:
+    """#002：溢出的長期記憶更新要依序處理，不能因為同時觸發而互相覆蓋。"""
+
+    def _make_manager(self, tmp_path, monkeypatch):
+        bot_mem_path = tmp_path / "bot_mem.md"
+        bot_mem_path.write_text("", encoding="utf-8")
+        monkeypatch.setattr(config, "BOT_MEMORY_PATH", str(bot_mem_path))
+        return MemoryManager(), bot_mem_path
+
+    def test_overflow_updates_are_processed_in_order(self, tmp_path, monkeypatch):
+        manager, bot_mem_path = self._make_manager(tmp_path, monkeypatch)
+
+        calls = []
+
+        async def fake_chat_completion(messages, response_format=None):
+            # 每次回應都疊加目前收到的既有長期記憶，藉此驗證後一筆
+            # 是不是真的讀到前一筆「已經寫回」的最新值，而不是同時讀到舊值。
+            existing = manager.bot_memory
+            calls.append(existing)
+            return f"{existing}+new"
+
+        monkeypatch.setattr("memory.chat_completion", fake_chat_completion)
+
+        # 直接透過 queue 排入三筆溢出，比湊 append_turn 的觸發條件更直接、更聚焦在序列化本身
+        async def run_three_overflows():
+            manager.start_worker()
+            for i in range(3):
+                await manager.summarize_into_long_term([{"role": "assistant", "content": f"msg{i}"}])
+            await manager.stop_worker()
+
+        asyncio.run(run_three_overflows())
+
+        # 三次呼叫應該依序發生，且每次看到的都是前一次已經寫回的結果
+        assert calls == ["", "+new", "+new+new"]
+        assert manager.bot_memory == "+new+new+new"
+        assert bot_mem_path.read_text(encoding="utf-8") == "+new+new+new"
+
+    def test_stop_worker_waits_for_queue_to_drain(self, tmp_path, monkeypatch):
+        manager, _ = self._make_manager(tmp_path, monkeypatch)
+
+        processed = []
+
+        async def slow_chat_completion(messages, response_format=None):
+            await asyncio.sleep(0.05)
+            processed.append(messages)
+            return "done"
+
+        monkeypatch.setattr("memory.chat_completion", slow_chat_completion)
+
+        async def run():
+            manager.start_worker()
+            await manager.summarize_into_long_term([{"role": "assistant", "content": "a"}])
+            await manager.summarize_into_long_term([{"role": "assistant", "content": "b"}])
+            # stop_worker 應該等兩筆都處理完才返回，不會提早砍斷還沒處理的項目
+            await manager.stop_worker()
+
+        asyncio.run(run())
+
+        assert len(processed) == 2
+
+    def test_append_turn_does_not_block_on_overflow(self, tmp_path, monkeypatch):
+        """append_turn 只需要把溢出排入 queue（sync），不應該自己去 await LLM。"""
+        manager, _ = self._make_manager(tmp_path, monkeypatch)
+
+        called = False
+
+        async def fake_chat_completion(messages, response_format=None):
+            nonlocal called
+            called = True
+            return "updated"
+
+        monkeypatch.setattr("memory.chat_completion", fake_chat_completion)
+
+        session = UserSession()
+        for i in range(config.MAX_HISTORY_MESSAGES + 2):
+            manager.append_turn(session, f"user{i}", f"reply{i}")
+
+        # append_turn 本身是 sync 呼叫，還沒有事件迴圈機會執行 worker，
+        # 所以此刻 LLM 一定還沒被呼叫到——證明沒有卡在這裡等待。
+        assert called is False
+        assert len(session.history) <= config.MAX_HISTORY_MESSAGES

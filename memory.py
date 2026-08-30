@@ -75,13 +75,47 @@ def stringify_content(content) -> str:
 
 
 class MemoryManager:
-    """管理長期記憶讀寫，並提供把對話寫入短期歷史／溢出摘要的方法。"""
+    """管理長期記憶讀寫，並提供把對話寫入短期歷史／溢出摘要的方法。
+
+    溢出的對話透過 asyncio.Queue 交給單一背景 worker 依序處理，避免短時間內
+    多個 summarize 同時讀到同一份舊 bot_memory、最後互相覆蓋彼此的更新結果。
+    """
 
     def __init__(self) -> None:
         self.bot_memory = load_bot_memory()
+        self._queue: asyncio.Queue[list[dict]] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+
+    def start_worker(self) -> None:
+        """啟動背景 worker。重複呼叫是安全的：worker 還在跑就不會重建。"""
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._worker_loop())
+
+    async def stop_worker(self) -> None:
+        """等 queue 清空後停止 worker，確保關閉前所有已排入的更新都處理完，不留下無限制的背景 task。"""
+        if self._worker_task is None:
+            return
+        await self._queue.join()
+        self._worker_task.cancel()
+        try:
+            await self._worker_task
+        except asyncio.CancelledError:
+            pass
+        self._worker_task = None
+
+    async def _worker_loop(self) -> None:
+        """依序消化 queue 中的溢出對話，一次只處理一筆，天生序列化。"""
+        while True:
+            overflow_messages = await self._queue.get()
+            try:
+                await self._summarize_into_long_term(overflow_messages)
+            except Exception:
+                logger.exception("長期記憶背景更新發生未預期錯誤")
+            finally:
+                self._queue.task_done()
 
     def append_turn(self, session, user_content, reply_content) -> None:
-        """把這一輪對話存入短期歷史，超過上限的部分交給長期記憶整理後砍掉。
+        """把這一輪對話存入短期歷史，超過上限的部分交給長期記憶 worker 依序整理。
 
         user_content 為 None 時代表這輪是主動發訊（沒有對應的使用者訊息），
         只存 assistant 這一半，不要塞一句假的 user 發言進去污染歷史紀錄。
@@ -94,10 +128,18 @@ class MemoryManager:
             overflow_count = len(session.history) - config.MAX_HISTORY_MESSAGES
             overflow = session.history[:overflow_count]
             del session.history[:overflow_count]
-            asyncio.create_task(self.summarize_into_long_term(overflow))
+            self._queue.put_nowait(overflow)
 
     async def summarize_into_long_term(self, overflow_messages: list[dict]) -> None:
-        """呼叫 LLM 把即將被短期記憶砍掉的內容整理進長期記憶檔案。"""
+        """供外部（例如 shutdown 時的 flush）直接排入 queue，走跟一般 overflow 相同的序列化路徑。"""
+        self._queue.put_nowait(overflow_messages)
+
+    async def _summarize_into_long_term(self, overflow_messages: list[dict]) -> None:
+        """呼叫 LLM 把即將被短期記憶砍掉的內容整理進長期記憶檔案。
+
+        每次都讀取 self.bot_memory「當下最新」的值，搭配 worker 序列化執行，
+        確保後一筆更新一定是疊加在前一筆已經寫回的結果之上。
+        """
         if not overflow_messages:
             return
 

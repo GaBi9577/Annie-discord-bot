@@ -59,6 +59,8 @@ async def on_ready():
             proactive_loop(client, sessions, memory_manager, state_holder)
         )
 
+    memory_manager.start_worker()
+
 
 @client.event
 async def on_message(message: discord.Message):
@@ -171,11 +173,19 @@ async def wait_then_reply(
 
 
 async def flush_remaining_history():
-    """程式關閉前，把還沒被截斷整理過的短期記憶強制存入長期記憶，避免遺失。"""
+    """程式關閉前，把還沒被截斷整理過的短期記憶排入 queue，並等 worker 處理完再停止。
+
+    這裡不能直接 await 每個 summarize，因為 worker 才是唯一實際執行整理的地方
+    （避免跟一般 overflow 用不同路徑寫入 bot_memory、破壞序列化保證）；
+    所以是「排入 queue → 啟動/沿用 worker → 等 queue 清空 → 停止 worker」。
+    """
     for _, session in sessions.all_sessions():
         if session.history:
             await memory_manager.summarize_into_long_term(session.history)
             session.history.clear()
+
+    memory_manager.start_worker()  # 保險：萬一 on_ready 從未觸發過
+    await memory_manager.stop_worker()
     logger.info("關閉前已將剩餘短期記憶存入長期記憶")
 
 
