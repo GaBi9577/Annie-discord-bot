@@ -1,6 +1,7 @@
 __pycache__/
 .pic/
 .task/
+.venv/
 .vscode/
 annie/
 apikey.py
