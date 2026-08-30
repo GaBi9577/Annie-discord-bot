@@ -3,6 +3,7 @@
 涵蓋 schedule 邊界、模型輸出解析、時間差格式化。
 """
 
+import asyncio
 import json
 import random
 import sys
@@ -16,7 +17,7 @@ import config
 from response_parser import parse_response
 from schedule import format_elapsed, get_schedule_status
 from session import UserSession
-from proactive import should_attempt_proactive
+from proactive import should_attempt_proactive, attempt_proactive_message
 
 TZ = ZoneInfo("Asia/Taipei")
 
@@ -87,6 +88,7 @@ class TestFormatElapsed:
         end = dt(12, 30)
         assert format_elapsed(start, end) == "2小時30分鐘"
 
+
 class TestUserSessionPendingBuffer:
     def test_take_pending_buffer_returns_current_content(self):
         session = UserSession()
@@ -121,6 +123,7 @@ class TestUserSessionPendingBuffer:
         assert session.pending_mode is None
         # clear_pending 只清旗標，不應清掉處理期間新寫入的 buffer
         assert session.pending_buffer == [{"text": "arrived while awaiting LLM", "images": []}]
+
 
 class TestParseResponse:
     def test_normal_response(self):
@@ -204,3 +207,75 @@ class TestShouldAttemptProactive:
 
         monkeypatch.setattr(random, "random", lambda: config.PROACTIVE_GATE_MAX_PROBABILITY + 0.01)
         assert should_attempt_proactive(session, now) is False
+
+
+class _FakeChannel:
+    """最小可用的假 Discord channel：可設定 send() 是否要拋錯，並記錄呼叫次數。"""
+
+    def __init__(self, raise_on_send: bool = False):
+        self.raise_on_send = raise_on_send
+        self.send_calls = 0
+
+    async def send(self, *args, **kwargs):
+        self.send_calls += 1
+        if self.raise_on_send:
+            raise RuntimeError("discord api boom")
+
+
+class _FakeMemoryManager:
+    def __init__(self):
+        self.bot_memory = ""
+        self.append_turn_calls = 0
+
+    def append_turn(self, session, user_content, reply_content):
+        self.append_turn_calls += 1
+
+
+class _FakeStateHolder:
+    def __init__(self):
+        self.value = "原本的狀態"
+        self.update_calls = 0
+
+    def update(self, new_state):
+        self.update_calls += 1
+        self.value = new_state
+
+
+class TestAttemptProactiveMessageSendFailure:
+    """#004：channel.send() 失敗不應讓例外往外冒，且不該誤記成功送出的狀態/記憶。"""
+
+    def test_send_failure_does_not_raise_and_skips_state_update(self, monkeypatch):
+        session = UserSession()
+        session.last_channel = _FakeChannel(raise_on_send=True)
+        memory_manager = _FakeMemoryManager()
+        state_holder = _FakeStateHolder()
+
+        async def fake_chat_completion(messages, response_format=None):
+            return json.dumps({"reply": "在嗎", "state": "有點想你", "image_prompt": None})
+
+        monkeypatch.setattr("proactive.chat_completion", fake_chat_completion)
+
+        # 不應拋出例外
+        asyncio.run(attempt_proactive_message(1, session, memory_manager, state_holder))
+
+        assert session.last_channel.send_calls == 1
+        # 發送失敗，狀態與記憶都不該被更新成「好像有送出去」的樣子
+        assert state_holder.update_calls == 0
+        assert memory_manager.append_turn_calls == 0
+
+    def test_send_success_updates_state_and_memory(self, monkeypatch):
+        session = UserSession()
+        session.last_channel = _FakeChannel(raise_on_send=False)
+        memory_manager = _FakeMemoryManager()
+        state_holder = _FakeStateHolder()
+
+        async def fake_chat_completion(messages, response_format=None):
+            return json.dumps({"reply": "在嗎", "state": "有點想你", "image_prompt": None})
+
+        monkeypatch.setattr("proactive.chat_completion", fake_chat_completion)
+
+        asyncio.run(attempt_proactive_message(1, session, memory_manager, state_holder))
+
+        assert session.last_channel.send_calls == 1
+        assert state_holder.update_calls == 1
+        assert memory_manager.append_turn_calls == 1

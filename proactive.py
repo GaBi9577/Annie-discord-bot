@@ -83,11 +83,17 @@ async def attempt_proactive_message(user_id, session, memory_manager, state_hold
         image_bytes = await generate_image(parsed.image_prompt)
 
     logger.info("主動發訊：%s", parsed.reply)
-    if image_bytes:
-        discord_file = discord.File(io.BytesIO(image_bytes), filename="annie.png")
-        await channel.send(content=parsed.reply, file=discord_file)
-    else:
-        await channel.send(parsed.reply)
+    try:
+        if image_bytes:
+            discord_file = discord.File(io.BytesIO(image_bytes), filename="annie.png")
+            await channel.send(content=parsed.reply, file=discord_file)
+        else:
+            await channel.send(parsed.reply)
+    except Exception:
+        # 單次發送失敗（例如 Discord API 錯誤）不該讓整個 proactive_loop 停擺，
+        # 記錄下來、跳過這次即可；下次背景迴圈醒來會再重新判斷一次。
+        logger.exception("主動發訊發送失敗，本次跳過")
+        return
 
     if parsed.state:
         state_holder.update(parsed.state)

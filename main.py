@@ -36,6 +36,8 @@ sessions = SessionManager()
 memory_manager = MemoryManager()
 state_holder = CurrentStateHolder()
 
+_proactive_task: asyncio.Task | None = None
+
 
 def extract_image_urls(message: discord.Message) -> list[str]:
     """從 Discord 訊息附件中取出圖片 URL。"""
@@ -48,7 +50,14 @@ def extract_image_urls(message: discord.Message) -> list[str]:
 @client.event
 async def on_ready():
     logger.info("Bot 已上線：%s", client.user)
-    client.loop.create_task(proactive_loop(client, sessions, memory_manager, state_holder))
+
+    global _proactive_task
+    # Discord reconnect 會再次觸發 on_ready；只在 loop 還沒啟動、或前一個已經
+    # 結束（例如例外導致退出）時才建立新的，避免同時存在多個 proactive loop。
+    if _proactive_task is None or _proactive_task.done():
+        _proactive_task = client.loop.create_task(
+            proactive_loop(client, sessions, memory_manager, state_holder)
+        )
 
 
 @client.event
