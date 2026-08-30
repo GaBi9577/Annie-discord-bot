@@ -38,7 +38,11 @@ BOT_MEMORY_PATH = "bot_mem.md"
 # 長期記憶檔案，由 bot 自動整理與更新
 # 短期記憶則數上限(user+assistant 合計，約 4 輪)
 # 超過的部分會自動整理進 bot_mem.md 再從短期記憶砍掉
-# 數字大小請憑實測手感調整，不用算得太精確
+
+BOT_MEMORY_MAX_CHARS = 4000
+# 長期記憶檔案的字數上限(粗略估計，不用算得太精確)
+# 每次更新後若超過，會再請 LLM 把 bot_mem.md 本身壓縮濃縮一次
+# 避免長期累積下 prompt token 成本無限增加
 
 CURRENT_STATE_PATH = "current_state.md"  # 現況小抄：短期內持續變動的狀態(情緒/動作/身體狀態等)
 

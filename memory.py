@@ -164,7 +164,38 @@ class MemoryManager:
             logger.exception("長期記憶整理失敗")
             return
 
+        updated_memory = await self._compress_if_too_long(updated_memory)
+
         self.bot_memory = updated_memory
         with open(config.BOT_MEMORY_PATH, "w", encoding="utf-8") as f:
             f.write(updated_memory)
         logger.info("長期記憶已更新")
+
+    async def _compress_if_too_long(self, memory_text: str) -> str:
+        """長期記憶超過字數上限時，再請 LLM 濃縮一次；避免 prompt token 成本無限增加。
+
+        壓縮失敗（例如 LLM 呼叫出錯）就照原樣回傳未壓縮的版本——寧可長度超標，
+        也不要因為壓縮這步失敗而遺失整份長期記憶。
+        """
+        if len(memory_text) <= config.BOT_MEMORY_MAX_CHARS:
+            return memory_text
+
+        compress_prompt = (
+            "以下是一份長期記憶摘要，目前太長了，請在不遺失重要資訊的前提下"
+            "進一步濃縮，去除重複、次要或已經不重要的細節，用更精簡的條列呈現。"
+            "只需要輸出濃縮後的長期記憶內容本身，不要有其他說明文字。\n\n"
+            f"【目前的長期記憶】\n{memory_text}"
+        )
+        try:
+            compressed = await chat_completion([{"role": "user", "content": compress_prompt}])
+            compressed = compressed.strip()
+        except Exception:
+            logger.exception("長期記憶壓縮失敗，暫時維持未壓縮版本")
+            return memory_text
+
+        if not compressed:
+            logger.warning("長期記憶壓縮結果為空，維持未壓縮版本")
+            return memory_text
+
+        logger.info("長期記憶已壓縮：%d 字 → %d 字", len(memory_text), len(compressed))
+        return compressed

@@ -363,3 +363,92 @@ class TestMemoryManagerQueueSerialization:
         # 所以此刻 LLM 一定還沒被呼叫到——證明沒有卡在這裡等待。
         assert called is False
         assert len(session.history) <= config.MAX_HISTORY_MESSAGES
+
+
+class TestMemoryManagerSizeLimit:
+    """#005：長期記憶超過字數上限時要再壓縮一次，避免無限增長。"""
+
+    def _make_manager(self, tmp_path, monkeypatch):
+        bot_mem_path = tmp_path / "bot_mem.md"
+        bot_mem_path.write_text("", encoding="utf-8")
+        monkeypatch.setattr(config, "BOT_MEMORY_PATH", str(bot_mem_path))
+        return MemoryManager(), bot_mem_path
+
+    def test_under_limit_does_not_trigger_compression(self, tmp_path, monkeypatch):
+        manager, bot_mem_path = self._make_manager(tmp_path, monkeypatch)
+        monkeypatch.setattr(config, "BOT_MEMORY_MAX_CHARS", 100)
+
+        call_count = 0
+
+        async def fake_chat_completion(messages, response_format=None):
+            nonlocal call_count
+            call_count += 1
+            return "短短的記憶"  # 遠小於 100 字上限
+
+        monkeypatch.setattr("memory.chat_completion", fake_chat_completion)
+
+        async def run():
+            manager.start_worker()
+            await manager.summarize_into_long_term([{"role": "assistant", "content": "hi"}])
+            await manager.stop_worker()
+
+        asyncio.run(run())
+
+        # 只有第一次的 summarize 呼叫，沒有額外觸發壓縮呼叫
+        assert call_count == 1
+        assert manager.bot_memory == "短短的記憶"
+        assert bot_mem_path.read_text(encoding="utf-8") == "短短的記憶"
+
+    def test_over_limit_triggers_compression_and_writes_compressed_result(self, tmp_path, monkeypatch):
+        manager, bot_mem_path = self._make_manager(tmp_path, monkeypatch)
+        monkeypatch.setattr(config, "BOT_MEMORY_MAX_CHARS", 10)
+
+        responses = ["這是一段超過十個字元長度的長期記憶內容", "濃縮後的短版本"]
+        call_count = 0
+
+        async def fake_chat_completion(messages, response_format=None):
+            nonlocal call_count
+            result = responses[call_count]
+            call_count += 1
+            return result
+
+        monkeypatch.setattr("memory.chat_completion", fake_chat_completion)
+
+        async def run():
+            manager.start_worker()
+            await manager.summarize_into_long_term([{"role": "assistant", "content": "hi"}])
+            await manager.stop_worker()
+
+        asyncio.run(run())
+
+        # 第一次 summarize + 第二次壓縮，共兩次呼叫
+        assert call_count == 2
+        assert manager.bot_memory == "濃縮後的短版本"
+        assert bot_mem_path.read_text(encoding="utf-8") == "濃縮後的短版本"
+
+    def test_compression_failure_keeps_uncompressed_version(self, tmp_path, monkeypatch):
+        manager, bot_mem_path = self._make_manager(tmp_path, monkeypatch)
+        monkeypatch.setattr(config, "BOT_MEMORY_MAX_CHARS", 10)
+
+        long_text = "這是一段超過十個字元長度的長期記憶內容"
+        call_count = 0
+
+        async def fake_chat_completion(messages, response_format=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return long_text
+            raise RuntimeError("壓縮呼叫失敗")
+
+        monkeypatch.setattr("memory.chat_completion", fake_chat_completion)
+
+        async def run():
+            manager.start_worker()
+            await manager.summarize_into_long_term([{"role": "assistant", "content": "hi"}])
+            await manager.stop_worker()
+
+        asyncio.run(run())
+
+        # 壓縮失敗時寧可維持超標的原版本，也不能整份記憶遺失
+        assert manager.bot_memory == long_text
+        assert bot_mem_path.read_text(encoding="utf-8") == long_text
