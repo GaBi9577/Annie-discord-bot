@@ -1,6 +1,7 @@
 __pycache__/
 .pic/
 .task/
+.vscode/
 annie/
 apikey.py
 bot_mem.md
