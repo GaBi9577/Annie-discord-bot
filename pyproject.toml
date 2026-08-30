@@ -4,15 +4,32 @@ version = "0.1.0"
 description = "單一使用者的個人 Discord Bot，角色為《進擊的巨人》亞妮·雷恩哈特，以同居設定互動。"
 requires-python = ">=3.11"
 dependencies = [
-    "discord.py>=2.4",
-    "openai>=1.40",
-    "requests>=2.31",
+    "discord.py==2.7.1",
+    "openai==1.109.1",
+    "requests==2.32.5",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
+    "pytest==8.3.3",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools]
+py-modules = [
+    "config",
+    "image_gen",
+    "image_provider_nanogpt",
+    "image_provider_pixai",
+    "llm_client",
+    "main",
+    "memory",
+    "proactive",
+    "prompt_builder",
+    "response_parser",
+    "schedule",
+    "session",
+    "state",
+]
