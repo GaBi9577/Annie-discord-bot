@@ -26,11 +26,21 @@ class UserSession:
     last_interaction_time: datetime | None = None  # 使用者發訊或她主動發訊都算，主動發訊判斷用
     last_channel: Any = None  # discord 頻道物件，記錄最後互動頻道，主動發訊要送去哪裡
 
+    def take_pending_buffer(self) -> list[dict]:
+        """取出目前的 pending_buffer 並立刻換上一個新的空 list（snapshot/consume）。
+
+        呼叫後，這輪 task 手上的回傳值是「當下那個時間點」的訊息快照，之後
+        新訊息（包含 task 正在 await LLM 期間收到的）會寫進新的空 list，
+        不會混進正在被這輪 task 處理的資料，也不會在 clear_pending() 時被誤刪。
+        """
+        buffer = self.pending_buffer
+        self.pending_buffer = []
+        return buffer
+
     def clear_pending(self) -> None:
-        """清掉這輪的 debounce/waiting 狀態，history 不受影響。"""
+        """清掉這輪的 debounce/waiting 狀態旗標，不動 pending_buffer（用 take_pending_buffer 處理）。"""
         self.pending_task = None
         self.pending_mode = None
-        self.pending_buffer = []
 
 
 class SessionManager:

@@ -87,6 +87,40 @@ class TestFormatElapsed:
         end = dt(12, 30)
         assert format_elapsed(start, end) == "2小時30分鐘"
 
+class TestUserSessionPendingBuffer:
+    def test_take_pending_buffer_returns_current_content(self):
+        session = UserSession()
+        session.pending_buffer.append({"text": "hi", "images": []})
+
+        taken = session.take_pending_buffer()
+
+        assert taken == [{"text": "hi", "images": []}]
+
+    def test_take_pending_buffer_leaves_fresh_empty_list(self):
+        session = UserSession()
+        session.pending_buffer.append({"text": "hi", "images": []})
+
+        taken = session.take_pending_buffer()
+        session.pending_buffer.append({"text": "new message during processing", "images": []})
+
+        # 舊 snapshot 不受之後寫入影響
+        assert taken == [{"text": "hi", "images": []}]
+        # 新訊息進到全新的 buffer，不會跟舊 snapshot 混在一起
+        assert session.pending_buffer == [{"text": "new message during processing", "images": []}]
+
+    def test_clear_pending_does_not_wipe_buffer_written_during_processing(self):
+        session = UserSession()
+        session.pending_task = object()
+        session.pending_mode = "debounce"
+
+        session.take_pending_buffer()
+        session.pending_buffer.append({"text": "arrived while awaiting LLM", "images": []})
+        session.clear_pending()
+
+        assert session.pending_task is None
+        assert session.pending_mode is None
+        # clear_pending 只清旗標，不應清掉處理期間新寫入的 buffer
+        assert session.pending_buffer == [{"text": "arrived while awaiting LLM", "images": []}]
 
 class TestParseResponse:
     def test_normal_response(self):

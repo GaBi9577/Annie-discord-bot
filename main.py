@@ -101,7 +101,7 @@ async def wait_then_reply(
     await asyncio.sleep(wait_seconds)
 
     session = sessions.get(user_id)
-    buffered = session.pending_buffer
+    buffered = session.take_pending_buffer()
     if not buffered:
         session.clear_pending()
         return
