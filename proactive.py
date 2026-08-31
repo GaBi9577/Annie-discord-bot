@@ -58,48 +58,59 @@ async def attempt_proactive_message(user_id, session, memory_manager, state_hold
     if session.pending_task is not None:
         return  # 使用者訊息正在處理中（debounce 或等待忙碌時段結束），這輪不搶著發
 
-    messages = build_proactive_check_messages(
-        history=session.history,
-        bot_memory=memory_manager.bot_memory,
-        current_state=state_holder.value,
-    )
+    if session.response_lock.locked():
+        return  # 對方的訊息正在跑關鍵段落，這輪主動發訊直接放棄，不排隊等待
 
-    try:
-        raw_text = await chat_completion(messages, response_format=RESPONSE_JSON_SCHEMA)
-    except Exception:
-        logger.exception("主動發訊檢查呼叫 LLM 失敗")
-        return
+    # 進入關鍵段落前才正式拿鎖：跟 wait_then_reply 共用同一把鎖，確保同一個
+    # session 不會同時有兩邊在組 prompt / 呼叫 LLM / 送出（P0-1）。
+    async with session.response_lock:
+        # 拿到鎖之後，pending_task 可能在等待期間被建立（使用者剛好在這時發訊），
+        # 因此進鎖後要再檢查一次，才能保證是拿到鎖當下才成立的狀態。
+        if session.pending_task is not None:
+            return
 
-    parsed = parse_response(raw_text)
+        messages = build_proactive_check_messages(
+            history=session.history,
+            bot_memory=memory_manager.bot_memory,
+            current_state=state_holder.value,
+        )
 
-    if parsed.reply == config.NO_PROACTIVE_TOKEN or parsed.reply.startswith(config.NO_PROACTIVE_TOKEN):
-        return  # 她這次判斷不想主動開口，不用做任何事
+        try:
+            raw_text = await chat_completion(messages, response_format=RESPONSE_JSON_SCHEMA)
+        except Exception:
+            logger.exception("主動發訊檢查呼叫 LLM 失敗")
+            return
 
-    if not parsed.reply:
-        return
+        parsed = parse_response(raw_text)
 
-    image_bytes = None
-    if parsed.image_prompt:
-        image_bytes = await generate_image(parsed.image_prompt)
+        if parsed.reply == config.NO_PROACTIVE_TOKEN or parsed.reply.startswith(config.NO_PROACTIVE_TOKEN):
+            return  # 她這次判斷不想主動開口，不用做任何事
 
-    logger.info("主動發訊：%s", parsed.reply)
-    try:
-        if image_bytes:
-            discord_file = discord.File(io.BytesIO(image_bytes), filename="annie.png")
-            await channel.send(content=parsed.reply, file=discord_file)
-        else:
-            await channel.send(parsed.reply)
-    except Exception:
-        # 單次發送失敗（例如 Discord API 錯誤）不該讓整個 proactive_loop 停擺，
-        # 記錄下來、跳過這次即可；下次背景迴圈醒來會再重新判斷一次。
-        logger.exception("主動發訊發送失敗，本次跳過")
-        return
+        if not parsed.reply:
+            return
 
-    if parsed.state:
-        state_holder.update(parsed.state)
+        image_bytes = None
+        if parsed.image_prompt:
+            image_bytes = await generate_image(parsed.image_prompt)
 
-    memory_manager.append_turn(session, None, parsed.reply)
-    session.last_interaction_time = now_taipei()
+        logger.info("主動發訊：%s", parsed.reply)
+        try:
+            if image_bytes:
+                discord_file = discord.File(io.BytesIO(image_bytes), filename="annie.png")
+                await channel.send(content=parsed.reply, file=discord_file)
+            else:
+                await channel.send(parsed.reply)
+        except Exception:
+            # 單次發送失敗（例如 Discord API 錯誤）不該讓整個 proactive_loop 停擺，
+            # 記錄下來、跳過這次即可；下次背景迴圈醒來會再重新判斷一次。
+            logger.exception("主動發訊發送失敗，本次跳過")
+            return
+
+        if parsed.state:
+            state_holder.update(parsed.state)
+
+        memory_manager.append_turn(session, None, parsed.reply)
+        session.last_interaction_time = now_taipei()
 
 
 async def proactive_loop(client, sessions, memory_manager, state_holder) -> None:

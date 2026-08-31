@@ -25,6 +25,9 @@ class UserSession:
     history: list[dict] = field(default_factory=list)
     last_interaction_time: datetime | None = None  # 使用者發訊或她主動發訊都算，主動發訊判斷用
     last_channel: Any = None  # discord 頻道物件，記錄最後互動頻道，主動發訊要送去哪裡
+    response_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 正常回覆與主動發訊共用同一把鎖，確保同一個使用者的「組 prompt →
+    # 呼叫 LLM → 送出」關鍵段落不會同時被兩邊搶著跑（P0-1）。
 
     def take_pending_buffer(self) -> list[dict]:
         """取出目前的 pending_buffer 並立刻換上一個新的空 list（snapshot/consume）。
@@ -41,6 +44,15 @@ class UserSession:
         """清掉這輪的 debounce/waiting 狀態旗標，不動 pending_buffer（用 take_pending_buffer 處理）。"""
         self.pending_task = None
         self.pending_mode = None
+
+    def requeue_pending_buffer(self, buffer: list[dict]) -> None:
+        """LLM 最終失敗時，把已取出的訊息塞回 pending_buffer 最前面（P1-1）。
+
+        用「取出時的內容 + 之後新進來的內容」重組，而不是直接覆蓋，
+        因為 take_pending_buffer() 之後、這次呼叫之前，可能已經有新訊息
+        寫進新的 pending_buffer；直接覆蓋會遺失那些新訊息。
+        """
+        self.pending_buffer = buffer + self.pending_buffer
 
 
 class SessionManager:

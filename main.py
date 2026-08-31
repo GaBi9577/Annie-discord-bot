@@ -139,37 +139,41 @@ async def wait_then_reply(
         catch_up_note=catch_up_note,
     )
 
-    async with message.channel.typing():
-        try:
-            raw_text = await chat_completion(messages, response_format=RESPONSE_JSON_SCHEMA)
-        except Exception:
-            logger.exception("LLM 呼叫最終失敗")
-            await message.channel.send("（訊號有點不穩，等一下再試一次）")
-            session.clear_pending()
-            return
+    # 關鍵段落（呼叫 LLM → 送出）要拿到 session 的鎖才能跑，避免跟同一個
+    # 使用者的主動發訊同時執行、互相搶著送訊息（P0-1）。
+    async with session.response_lock:
+        async with message.channel.typing():
+            try:
+                raw_text = await chat_completion(messages, response_format=RESPONSE_JSON_SCHEMA)
+            except Exception:
+                logger.exception("LLM 呼叫最終失敗，訊息塞回 pending buffer 避免遺失")
+                session.requeue_pending_buffer(buffered)
+                await message.channel.send("（訊號有點不穩，等一下再試一次）")
+                session.clear_pending()
+                return
 
-    parsed = parse_response(raw_text)
+        parsed = parse_response(raw_text)
 
-    image_bytes = None
-    if parsed.image_prompt:
-        image_bytes = await generate_image(parsed.image_prompt)
+        image_bytes = None
+        if parsed.image_prompt:
+            image_bytes = await generate_image(parsed.image_prompt)
 
-    logger.info("回傳內容：%s", parsed.reply)
+        logger.info("回傳內容：%s", parsed.reply)
 
-    if image_bytes:
-        discord_file = discord.File(io.BytesIO(image_bytes), filename="annie.png")
-        await message.channel.send(content=parsed.reply, file=discord_file)
-    else:
-        await message.channel.send(parsed.reply)
+        if image_bytes:
+            discord_file = discord.File(io.BytesIO(image_bytes), filename="annie.png")
+            await message.channel.send(content=parsed.reply, file=discord_file)
+        else:
+            await message.channel.send(parsed.reply)
 
-    if parsed.state:
-        state_holder.update(parsed.state)
-    else:
-        logger.warning("模型沒有依格式輸出現況小抄，本輪狀態維持不變")
+        if parsed.state:
+            state_holder.update(parsed.state)
+        else:
+            logger.warning("模型沒有依格式輸出現況小抄，本輪狀態維持不變")
 
-    memory_manager.append_turn(session, user_content, parsed.reply)
-    session.last_interaction_time = now_taipei()
-    session.clear_pending()
+        memory_manager.append_turn(session, user_content, parsed.reply)
+        session.last_interaction_time = now_taipei()
+        session.clear_pending()
 
 
 async def flush_remaining_history():
@@ -189,11 +193,35 @@ async def flush_remaining_history():
     logger.info("關閉前已將剩餘短期記憶存入長期記憶")
 
 
+async def shutdown():
+    """關閉前的清理，跟 client 共用同一個 event loop（P0-2）。
+
+    _proactive_task 要先取消並 await，確保它不會在 flush 進行到一半時
+    又醒來嘗試送訊息、或在 loop 收尾階段留下未處理的例外。
+    """
+    if _proactive_task is not None:
+        _proactive_task.cancel()
+        try:
+            await _proactive_task
+        except asyncio.CancelledError:
+            pass
+
+    await flush_remaining_history()
+
+
+async def main():
+    """單一 async 入口：啟動、執行、關閉都在同一個 event loop 裡完成，
+    不再有『client.run() 結束後另開一個 asyncio.run()』的第二層生命週期。
+    """
+    async with client:
+        try:
+            await client.start(config.TOKEN)
+        finally:
+            await shutdown()
+
+
 def run():
-    try:
-        client.run(config.TOKEN)
-    finally:
-        asyncio.run(flush_remaining_history())
+    asyncio.run(main())
 
 
 if __name__ == "__main__":

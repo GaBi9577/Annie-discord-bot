@@ -90,6 +90,44 @@ class TestFormatElapsed:
         assert format_elapsed(start, end) == "2小時30分鐘"
 
 
+class TestUserSessionRequeuePendingBuffer:
+    """P1-1：LLM 最終失敗時，已取出的訊息要塞回去，不能遺失。"""
+
+    def test_requeue_puts_taken_messages_back(self):
+        session = UserSession()
+        session.pending_buffer.append({"text": "hi", "images": []})
+        taken = session.take_pending_buffer()
+
+        session.requeue_pending_buffer(taken)
+
+        assert session.pending_buffer == [{"text": "hi", "images": []}]
+
+    def test_requeue_preserves_order_with_messages_arrived_during_processing(self):
+        """LLM 處理期間如果又有新訊息進來，requeue 後順序要是「舊訊息在前、新訊息在後」。"""
+        session = UserSession()
+        session.pending_buffer.append({"text": "first", "images": []})
+        taken = session.take_pending_buffer()
+
+        # 模擬處理期間使用者又傳了新訊息
+        session.pending_buffer.append({"text": "second", "images": []})
+
+        session.requeue_pending_buffer(taken)
+
+        assert session.pending_buffer == [
+            {"text": "first", "images": []},
+            {"text": "second", "images": []},
+        ]
+
+    def test_requeue_does_not_duplicate_when_buffer_was_empty(self):
+        session = UserSession()
+        session.pending_buffer.append({"text": "only", "images": []})
+        taken = session.take_pending_buffer()
+
+        session.requeue_pending_buffer(taken)
+
+        assert len(session.pending_buffer) == 1
+
+
 class TestUserSessionPendingBuffer:
     def test_take_pending_buffer_returns_current_content(self):
         session = UserSession()
@@ -280,6 +318,53 @@ class TestAttemptProactiveMessageSendFailure:
         assert session.last_channel.send_calls == 1
         assert state_holder.update_calls == 1
         assert memory_manager.append_turn_calls == 1
+
+
+class TestAttemptProactiveMessageLock:
+    """P0-1：session.response_lock 被占用時（正常對話正在跑關鍵段落），
+    主動發訊這輪要直接放棄，不能搶著送、也不能排隊等待造成訊息延遲送出。
+    """
+
+    def test_skips_when_lock_is_already_held(self, monkeypatch):
+        session = UserSession()
+        session.last_channel = _FakeChannel(raise_on_send=False)
+        memory_manager = _FakeMemoryManager()
+        state_holder = _FakeStateHolder()
+
+        chat_completion_calls = 0
+
+        async def fake_chat_completion(messages, response_format=None):
+            nonlocal chat_completion_calls
+            chat_completion_calls += 1
+            return json.dumps({"reply": "在嗎", "state": "有點想你", "image_prompt": None})
+
+        monkeypatch.setattr("proactive.chat_completion", fake_chat_completion)
+
+        async def run_with_lock_held():
+            async with session.response_lock:
+                await attempt_proactive_message(1, session, memory_manager, state_holder)
+
+        asyncio.run(run_with_lock_held())
+
+        # 鎖被占用時應該直接放棄，不該呼叫 LLM、也不該送訊息
+        assert chat_completion_calls == 0
+        assert session.last_channel.send_calls == 0
+
+    def test_proceeds_when_lock_is_free(self, monkeypatch):
+        session = UserSession()
+        session.last_channel = _FakeChannel(raise_on_send=False)
+        memory_manager = _FakeMemoryManager()
+        state_holder = _FakeStateHolder()
+
+        async def fake_chat_completion(messages, response_format=None):
+            return json.dumps({"reply": "在嗎", "state": "有點想你", "image_prompt": None})
+
+        monkeypatch.setattr("proactive.chat_completion", fake_chat_completion)
+
+        asyncio.run(attempt_proactive_message(1, session, memory_manager, state_holder))
+
+        assert session.last_channel.send_calls == 1
+        assert not session.response_lock.locked()  # 結束後鎖要釋放乾淨
 
 
 class TestMemoryManagerQueueSerialization:
