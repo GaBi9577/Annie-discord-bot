@@ -81,3 +81,6 @@ PROACTIVE_GATE_BASE_PROBABILITY = 0.15     # 第一關基礎機率(剛過最短�
 PROACTIVE_GATE_MAX_PROBABILITY = 0.6       # 第一關機率上限(閒置越久機率越高，但封頂)
 PROACTIVE_GATE_GROWTH_PER_HOUR = 0.15      # 每多閒置一小時，機率增加多少
 NO_PROACTIVE_TOKEN = "NO_PROACTIVE"        # LLM 判斷這次不想主動發訊時，固定回覆這串字
+
+PROACTIVE_BACKOFF_MULTIPLIER = 2           # 主動發訊呼叫 LLM 失敗後，下次等待間隔的放大倍率
+PROACTIVE_BACKOFF_MAX_MULTIPLIER = 8       # 放大倍率上限(避免失敗一直持續下去，等待時間無限拉長)

@@ -49,17 +49,22 @@ def should_attempt_proactive(session, now: datetime) -> bool:
     return random.random() < probability
 
 
-async def attempt_proactive_message(user_id, session, memory_manager, state_holder) -> None:
-    """第二關：真的呼叫 LLM，讓她根據狀態/長期記憶/時段判斷這次要不要主動傳訊息、傳什麼。"""
+async def attempt_proactive_message(user_id, session, memory_manager, state_holder) -> bool:
+    """第二關：真的呼叫 LLM，讓她根據狀態/長期記憶/時段判斷這次要不要主動傳訊息、傳什麼。
+
+    回傳值只代表「呼叫 LLM 是否失敗」，給 proactive_loop 用來決定要不要
+    套用 backoff；沒頻道、鎖被占用、判斷不想開口、發送失敗等情況都不算
+    LLM 失敗，回傳 False（不影響 backoff 狀態）。
+    """
     channel = session.last_channel
     if channel is None:
-        return  # 還沒有已知的頻道可以送，跳過
+        return False  # 還沒有已知的頻道可以送，跳過
 
     if session.pending_task is not None:
-        return  # 使用者訊息正在處理中（debounce 或等待忙碌時段結束），這輪不搶著發
+        return False  # 使用者訊息正在處理中（debounce 或等待忙碌時段結束），這輪不搶著發
 
     if session.response_lock.locked():
-        return  # 對方的訊息正在跑關鍵段落，這輪主動發訊直接放棄，不排隊等待
+        return False  # 對方的訊息正在跑關鍵段落，這輪主動發訊直接放棄，不排隊等待
 
     # 進入關鍵段落前才正式拿鎖：跟 wait_then_reply 共用同一把鎖，確保同一個
     # session 不會同時有兩邊在組 prompt / 呼叫 LLM / 送出（P0-1）。
@@ -67,7 +72,7 @@ async def attempt_proactive_message(user_id, session, memory_manager, state_hold
         # 拿到鎖之後，pending_task 可能在等待期間被建立（使用者剛好在這時發訊），
         # 因此進鎖後要再檢查一次，才能保證是拿到鎖當下才成立的狀態。
         if session.pending_task is not None:
-            return
+            return False
 
         messages = build_proactive_check_messages(
             history=session.history,
@@ -79,15 +84,15 @@ async def attempt_proactive_message(user_id, session, memory_manager, state_hold
             raw_text = await chat_completion(messages, response_format=RESPONSE_JSON_SCHEMA)
         except Exception:
             logger.exception("主動發訊檢查呼叫 LLM 失敗")
-            return
+            return True
 
         parsed = parse_response(raw_text)
 
         if parsed.reply == config.NO_PROACTIVE_TOKEN or parsed.reply.startswith(config.NO_PROACTIVE_TOKEN):
-            return  # 她這次判斷不想主動開口，不用做任何事
+            return False  # 她這次判斷不想主動開口，不用做任何事
 
         if not parsed.reply:
-            return
+            return False
 
         image_bytes = None
         if parsed.image_prompt:
@@ -104,23 +109,31 @@ async def attempt_proactive_message(user_id, session, memory_manager, state_hold
             # 單次發送失敗（例如 Discord API 錯誤）不該讓整個 proactive_loop 停擺，
             # 記錄下來、跳過這次即可；下次背景迴圈醒來會再重新判斷一次。
             logger.exception("主動發訊發送失敗，本次跳過")
-            return
+            return False
 
         if parsed.state:
             state_holder.update(parsed.state)
 
         memory_manager.append_turn(session, None, parsed.reply)
         session.last_interaction_time = now_taipei()
+        return False
 
 
 async def proactive_loop(client, sessions, memory_manager, state_holder) -> None:
-    """背景迴圈：每隔一段隨機時間醒來檢查一次，決定要不要主動傳訊息。"""
+    """背景迴圈：每隔一段隨機時間醒來檢查一次，決定要不要主動傳訊息。
+
+    連續呼叫 LLM 失敗時，等待間隔會依 PROACTIVE_BACKOFF_MULTIPLIER 逐次放大
+    （封頂於 PROACTIVE_BACKOFF_MAX_MULTIPLIER），避免在 API 出問題或設定錯誤
+    期間持續浪費呼叫額度；只要有一次成功執行完整輪次（不論最終有沒有真的送
+    訊息），就把倍率重置回 1。
+    """
     await client.wait_until_ready()
+    backoff_multiplier = 1
     while not client.is_closed():
         wait_minutes = random.uniform(
             config.PROACTIVE_CHECK_INTERVAL_MIN_MINUTES,
             config.PROACTIVE_CHECK_INTERVAL_MAX_MINUTES,
-        )
+        ) * backoff_multiplier
         await asyncio.sleep(wait_minutes * 60)
 
         now = now_taipei()
@@ -128,6 +141,17 @@ async def proactive_loop(client, sessions, memory_manager, state_holder) -> None
         if status.blocking:
             continue  # 睡覺／健身時段不主動；其他時段（含上課中）都可能觸發
 
+        any_failure = False
         for user_id, session in list(sessions.all_sessions()):
             if should_attempt_proactive(session, now):
-                await attempt_proactive_message(user_id, session, memory_manager, state_holder)
+                failed = await attempt_proactive_message(user_id, session, memory_manager, state_holder)
+                any_failure = any_failure or failed
+
+        if any_failure:
+            backoff_multiplier = min(
+                backoff_multiplier * config.PROACTIVE_BACKOFF_MULTIPLIER,
+                config.PROACTIVE_BACKOFF_MAX_MULTIPLIER,
+            )
+            logger.warning("主動發訊呼叫 LLM 失敗，下次等待間隔倍率調整為 %sx", backoff_multiplier)
+        else:
+            backoff_multiplier = 1

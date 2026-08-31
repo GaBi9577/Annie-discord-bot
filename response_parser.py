@@ -65,20 +65,34 @@ RESPONSE_JSON_SCHEMA = {
 }
 
 
+FALLBACK_REPLY = "（訊號有點不穩，等一下再試一次）"
+# 結構化輸出解析失敗時的安全回覆文字，統一用跟 LLM 呼叫失敗一致的措辭，
+# 使用者不會感覺到「這其實是另一種內部錯誤」。
+
+
 def parse_response(raw_json_text: str) -> ParsedResponse:
     """把 API 回傳的 JSON 字串轉成 ParsedResponse。
 
     理論上 response_format=json_schema 已經強制格式正確，這裡的 try/except
     只是防止極端情況（例如某個 provider 沒有真的套用 schema）讓整輪對話直接
-    炸掉——退化成把整段原始文字當作 reply，至少使用者還看得到回覆。
+    炸掉。但解析失敗時的原始文字可能是不完整的 JSON 片段或協定層雜訊
+    （例如截斷到一半的字串），不適合直接當成 reply 送給使用者看，所以改成
+    回傳固定的安全 fallback 訊息，並把原始內容完整記錄到 log 供除錯。
     """
     try:
         data = json.loads(raw_json_text)
     except (json.JSONDecodeError, TypeError):
-        logger.warning("模型輸出不是合法 JSON，整段當作 reply 處理：%r", raw_json_text)
-        return ParsedResponse(reply=(raw_json_text or "").strip(), state=None, image_prompt=None)
+        logger.warning("模型輸出不是合法 JSON，改用安全 fallback 回覆：%r", raw_json_text)
+        return ParsedResponse(reply=FALLBACK_REPLY, state=None, image_prompt=None)
+
+    if not isinstance(data, dict):
+        logger.warning("模型輸出不是 JSON object，改用安全 fallback 回覆：%r", raw_json_text)
+        return ParsedResponse(reply=FALLBACK_REPLY, state=None, image_prompt=None)
 
     reply = (data.get("reply") or "").strip()
+    if not reply:
+        logger.warning("模型輸出缺少 reply 內容，改用安全 fallback 回覆：%r", raw_json_text)
+        reply = FALLBACK_REPLY
 
     state = data.get("state")
     state = state.strip() if isinstance(state, str) and state.strip() else None

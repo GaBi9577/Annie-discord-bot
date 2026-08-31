@@ -11,12 +11,14 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config
-from response_parser import parse_response
+from response_parser import parse_response, FALLBACK_REPLY
 from schedule import format_elapsed, get_schedule_status
-from session import UserSession
+from session import UserSession, SessionManager
 from proactive import should_attempt_proactive, attempt_proactive_message
 from memory import MemoryManager
 
@@ -202,12 +204,28 @@ class TestParseResponse:
         assert result.reply == "回覆內容"
         assert result.state == "狀態內容"
 
-    def test_malformed_json_falls_back_to_raw_text_as_reply(self):
+    def test_malformed_json_falls_back_to_safe_reply(self):
+        """P1-3：解析失敗時不能把原始文字直接送給使用者，要用固定的安全 fallback。"""
         raw = "不是合法 JSON 的原始文字"
         result = parse_response(raw)
-        assert result.reply == "不是合法 JSON 的原始文字"
+        assert result.reply == FALLBACK_REPLY
         assert result.state is None
         assert result.image_prompt is None
+
+    def test_non_object_json_falls_back_to_safe_reply(self):
+        """解析成功但不是 JSON object（例如純陣列或字串）也要當成失敗處理。"""
+        raw = json.dumps(["這不是 object"])
+        result = parse_response(raw)
+        assert result.reply == FALLBACK_REPLY
+        assert result.state is None
+        assert result.image_prompt is None
+
+    def test_empty_reply_falls_back_to_safe_reply(self):
+        """JSON 格式正確但 reply 是空字串時，也不該把空白送給使用者。"""
+        raw = json.dumps({"reply": "", "state": "狀態還在", "image_prompt": None})
+        result = parse_response(raw)
+        assert result.reply == FALLBACK_REPLY
+        assert result.state == "狀態還在"  # 其他欄位仍照常解析
 
     def test_missing_fields_do_not_crash(self):
         raw = json.dumps({"reply": "只有 reply 欄位"})
@@ -365,6 +383,170 @@ class TestAttemptProactiveMessageLock:
 
         assert session.last_channel.send_calls == 1
         assert not session.response_lock.locked()  # 結束後鎖要釋放乾淨
+
+
+class TestAttemptProactiveMessageReturnValue:
+    """P1-2：回傳值只代表『LLM 呼叫是否失敗』，用來讓 proactive_loop 判斷要不要 backoff。"""
+
+    def test_llm_failure_returns_true(self, monkeypatch):
+        session = UserSession()
+        session.last_channel = _FakeChannel(raise_on_send=False)
+        memory_manager = _FakeMemoryManager()
+        state_holder = _FakeStateHolder()
+
+        async def fake_chat_completion(messages, response_format=None):
+            raise RuntimeError("api boom")
+
+        monkeypatch.setattr("proactive.chat_completion", fake_chat_completion)
+
+        failed = asyncio.run(attempt_proactive_message(1, session, memory_manager, state_holder))
+
+        assert failed is True
+
+    def test_llm_success_returns_false(self, monkeypatch):
+        session = UserSession()
+        session.last_channel = _FakeChannel(raise_on_send=False)
+        memory_manager = _FakeMemoryManager()
+        state_holder = _FakeStateHolder()
+
+        async def fake_chat_completion(messages, response_format=None):
+            return json.dumps({"reply": "在嗎", "state": "有點想你", "image_prompt": None})
+
+        monkeypatch.setattr("proactive.chat_completion", fake_chat_completion)
+
+        failed = asyncio.run(attempt_proactive_message(1, session, memory_manager, state_holder))
+
+        assert failed is False
+
+    def test_no_proactive_token_is_not_a_failure(self, monkeypatch):
+        """她判斷不想開口(NO_PROACTIVE)是正常結果，不該算成失敗、不該觸發 backoff。"""
+        session = UserSession()
+        session.last_channel = _FakeChannel(raise_on_send=False)
+        memory_manager = _FakeMemoryManager()
+        state_holder = _FakeStateHolder()
+
+        async def fake_chat_completion(messages, response_format=None):
+            return json.dumps({"reply": config.NO_PROACTIVE_TOKEN, "state": "原本的狀態", "image_prompt": None})
+
+        monkeypatch.setattr("proactive.chat_completion", fake_chat_completion)
+
+        failed = asyncio.run(attempt_proactive_message(1, session, memory_manager, state_holder))
+
+        assert failed is False
+        assert session.last_channel.send_calls == 0
+
+    def test_send_failure_is_not_an_llm_failure(self, monkeypatch):
+        """發送失敗跟 LLM 呼叫失敗是不同層級的問題，不該一起觸發 backoff。"""
+        session = UserSession()
+        session.last_channel = _FakeChannel(raise_on_send=True)
+        memory_manager = _FakeMemoryManager()
+        state_holder = _FakeStateHolder()
+
+        async def fake_chat_completion(messages, response_format=None):
+            return json.dumps({"reply": "在嗎", "state": "有點想你", "image_prompt": None})
+
+        monkeypatch.setattr("proactive.chat_completion", fake_chat_completion)
+
+        failed = asyncio.run(attempt_proactive_message(1, session, memory_manager, state_holder))
+
+        assert failed is False
+
+
+class TestProactiveLoopBackoff:
+    """P1-2：連續 LLM 失敗要放大等待間隔（封頂），成功一次就重置回原本間隔。"""
+
+    def _make_client(self, ready=True):
+        class _FakeClient:
+            def __init__(self):
+                self._closed = False
+
+            async def wait_until_ready(self):
+                return None
+
+            def is_closed(self):
+                return self._closed
+
+        return _FakeClient()
+
+    def test_backoff_multiplier_grows_then_resets(self, monkeypatch):
+        from proactive import proactive_loop
+
+        client = self._make_client()
+        sessions_manager = SessionManager()
+        session = sessions_manager.get(1)
+        session.last_channel = _FakeChannel(raise_on_send=False)
+        session.last_interaction_time = None  # should_attempt_proactive 會回 False，簡化這個測試只測 backoff 排程本身
+        memory_manager = _FakeMemoryManager()
+        state_holder = _FakeStateHolder()
+
+        recorded_sleep_minutes = []
+        call_count = 0
+
+        async def fake_sleep(seconds):
+            recorded_sleep_minutes.append(seconds / 60)
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 4:
+                client._closed = True  # 跑滿 4 輪後結束迴圈
+
+        # 固定隨機區間為單一數值，讓每輪基礎等待時間可預期
+        monkeypatch.setattr(random, "uniform", lambda a, b: a)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        # should_attempt_proactive 恆回傳 True，但讓 attempt_proactive_message
+        # 直接模擬失敗/成功交替，不需要真的跑 LLM 呼叫路徑
+        monkeypatch.setattr("proactive.should_attempt_proactive", lambda s, now: True)
+
+        outcomes = iter([True, True, False, True])  # 失敗、失敗、成功(重置)、失敗
+
+        async def fake_attempt(user_id, session, memory_manager, state_holder):
+            return next(outcomes)
+
+        monkeypatch.setattr("proactive.attempt_proactive_message", fake_attempt)
+
+        asyncio.run(proactive_loop(client, sessions_manager, memory_manager, state_holder))
+
+        base = config.PROACTIVE_CHECK_INTERVAL_MIN_MINUTES
+        # 第1輪：初始倍率 1x；第2輪：前一輪失敗 → 2x；第3輪：前一輪又失敗 → 4x；
+        # 第4輪：前一輪成功重置 → 回到 1x
+        assert recorded_sleep_minutes == pytest.approx([base * 1, base * 2, base * 4, base * 1])
+
+    def test_backoff_multiplier_is_capped(self, monkeypatch):
+        from proactive import proactive_loop
+
+        client = self._make_client()
+        sessions_manager = SessionManager()
+        memory_manager = _FakeMemoryManager()
+        state_holder = _FakeStateHolder()
+
+        recorded_sleep_minutes = []
+        call_count = 0
+
+        async def fake_sleep(seconds):
+            recorded_sleep_minutes.append(seconds / 60)
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 5:
+                client._closed = True
+
+        monkeypatch.setattr(random, "uniform", lambda a, b: a)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr("proactive.should_attempt_proactive", lambda s, now: True)
+
+        async def fake_attempt_always_fails(user_id, session, memory_manager, state_holder):
+            return True
+
+        monkeypatch.setattr("proactive.attempt_proactive_message", fake_attempt_always_fails)
+
+        sessions_manager.get(1)  # 至少要有一個 session 才會進入 attempt 分支
+
+        asyncio.run(proactive_loop(client, sessions_manager, memory_manager, state_holder))
+
+        base = config.PROACTIVE_CHECK_INTERVAL_MIN_MINUTES
+        cap = config.PROACTIVE_BACKOFF_MAX_MULTIPLIER
+        # 連續失敗最終應該封頂在 PROACTIVE_BACKOFF_MAX_MULTIPLIER，不會無限放大
+        assert recorded_sleep_minutes[-1] == pytest.approx(base * cap)
+        assert recorded_sleep_minutes[-1] <= base * cap + 1e-9
 
 
 class TestMemoryManagerQueueSerialization:
