@@ -632,6 +632,88 @@ class TestMemoryManagerQueueSerialization:
         assert len(session.history) <= config.MAX_HISTORY_MESSAGES
 
 
+class TestMemoryManagerObservability:
+    """P2-1：queue 積壓與成功/失敗時間要能從 log 與屬性上觀察到，不需要額外的 metrics 系統。"""
+
+    def _make_manager(self, tmp_path, monkeypatch):
+        bot_mem_path = tmp_path / "bot_mem.md"
+        bot_mem_path.write_text("", encoding="utf-8")
+        monkeypatch.setattr(config, "BOT_MEMORY_PATH", str(bot_mem_path))
+        return MemoryManager(), bot_mem_path
+
+    def test_success_updates_last_success_timestamp(self, tmp_path, monkeypatch):
+        manager, _ = self._make_manager(tmp_path, monkeypatch)
+
+        async def fake_chat_completion(messages, response_format=None):
+            return "updated"
+
+        monkeypatch.setattr("memory.chat_completion", fake_chat_completion)
+
+        assert manager.last_memory_update_success is None
+
+        async def run():
+            manager.start_worker()
+            await manager.summarize_into_long_term([{"role": "assistant", "content": "a"}])
+            await manager.stop_worker()
+
+        asyncio.run(run())
+
+        assert manager.last_memory_update_success is not None
+        assert manager.last_memory_update_failure is None
+
+    def test_failure_updates_last_failure_timestamp(self, tmp_path, monkeypatch):
+        manager, _ = self._make_manager(tmp_path, monkeypatch)
+
+        async def failing_chat_completion(messages, response_format=None):
+            raise RuntimeError("api boom")
+
+        monkeypatch.setattr("memory.chat_completion", failing_chat_completion)
+
+        async def run():
+            manager.start_worker()
+            await manager.summarize_into_long_term([{"role": "assistant", "content": "a"}])
+            await manager.stop_worker()
+
+        asyncio.run(run())
+
+        assert manager.last_memory_update_failure is not None
+        assert manager.last_memory_update_success is None
+
+    def test_queue_size_reflects_pending_items(self, tmp_path, monkeypatch):
+        manager, _ = self._make_manager(tmp_path, monkeypatch)
+
+        async def enqueue_two():
+            await manager.summarize_into_long_term([{"role": "assistant", "content": "a"}])
+            await manager.summarize_into_long_term([{"role": "assistant", "content": "b"}])
+
+        # 沒呼叫 start_worker，兩筆會停留在 queue 裡，可以直接檢查積壓數量
+        asyncio.run(enqueue_two())
+
+        assert manager.queue_size == 2
+
+    def test_large_backlog_is_logged_as_warning(self, tmp_path, monkeypatch, caplog):
+        """積壓超過警告門檻時要留下 log，方便從記錄診斷佇列健康狀況。"""
+        manager, _ = self._make_manager(tmp_path, monkeypatch)
+        import memory as memory_module
+
+        async def slow_chat_completion(messages, response_format=None):
+            await asyncio.sleep(0.02)
+            return "updated"
+
+        monkeypatch.setattr("memory.chat_completion", slow_chat_completion)
+
+        async def run():
+            manager.start_worker()
+            for i in range(memory_module.MEMORY_QUEUE_WARN_SIZE + 1):
+                await manager.summarize_into_long_term([{"role": "assistant", "content": f"msg{i}"}])
+            await manager.stop_worker()
+
+        with caplog.at_level("WARNING", logger="memory"):
+            asyncio.run(run())
+
+        assert any("積壓" in record.message for record in caplog.records)
+
+
 class TestMemoryManagerSizeLimit:
     """#005：長期記憶超過字數上限時要再壓縮一次，避免無限增長。"""
 

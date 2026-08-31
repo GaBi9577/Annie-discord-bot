@@ -14,8 +14,13 @@ import logging
 
 import config
 from llm_client import chat_completion
+from schedule import now_taipei
 
 logger = logging.getLogger(__name__)
+
+MEMORY_QUEUE_WARN_SIZE = 3
+# queue 積壓超過這個筆數就額外警告——正常情況下 worker 會很快消化掉，
+# 累積到這個量通常代表 summarize 持續失敗或變慢（P2-1 可觀測性）。
 
 
 def load_bot_memory() -> str:
@@ -85,6 +90,8 @@ class MemoryManager:
         self.bot_memory = load_bot_memory()
         self._queue: asyncio.Queue[list[dict]] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        self.last_memory_update_success: object = None  # 最近一次成功更新的時間(datetime | None)
+        self.last_memory_update_failure: object = None  # 最近一次失敗的時間(datetime | None)
 
     def start_worker(self) -> None:
         """啟動背景 worker。重複呼叫是安全的：worker 還在跑就不會重建。"""
@@ -103,13 +110,24 @@ class MemoryManager:
             pass
         self._worker_task = None
 
+    @property
+    def queue_size(self) -> int:
+        """目前待處理的溢出批次數，供日後需要時查詢佇列健康狀態用。"""
+        return self._queue.qsize()
+
     async def _worker_loop(self) -> None:
         """依序消化 queue 中的溢出對話，一次只處理一筆，天生序列化。"""
         while True:
             overflow_messages = await self._queue.get()
+
+            queue_size = self._queue.qsize()
+            if queue_size >= MEMORY_QUEUE_WARN_SIZE:
+                logger.warning("長期記憶佇列積壓中，待處理筆數：%d", queue_size)
+
             try:
                 await self._summarize_into_long_term(overflow_messages)
             except Exception:
+                self.last_memory_update_failure = now_taipei()
                 logger.exception("長期記憶背景更新發生未預期錯誤")
             finally:
                 self._queue.task_done()
@@ -161,6 +179,7 @@ class MemoryManager:
             updated_memory = await chat_completion([{"role": "user", "content": summarize_prompt}])
             updated_memory = updated_memory.strip()
         except Exception:
+            self.last_memory_update_failure = now_taipei()
             logger.exception("長期記憶整理失敗")
             return
 
@@ -169,6 +188,7 @@ class MemoryManager:
         self.bot_memory = updated_memory
         with open(config.BOT_MEMORY_PATH, "w", encoding="utf-8") as f:
             f.write(updated_memory)
+        self.last_memory_update_success = now_taipei()
         logger.info("長期記憶已更新")
 
     async def _compress_if_too_long(self, memory_text: str) -> str:
