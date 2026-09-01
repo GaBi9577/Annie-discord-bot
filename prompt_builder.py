@@ -11,7 +11,8 @@ from __future__ import annotations
 from datetime import datetime
 
 import config
-from schedule import WEEKDAY_NAMES, get_schedule_status, now_taipei
+import schedule_override
+from schedule import WEEKDAY_NAMES, format_elapsed, get_schedule_status, now_taipei
 
 
 def _load_text(path: str) -> str:
@@ -55,6 +56,10 @@ _OUTPUT_FORMAT_INSTRUCTIONS = (
     "拍攝角度如平視／俯角／仰角、視角如第一人稱自拍或第三人稱旁觀，"
     "依照這次想呈現的場景自由決定，不要每次都套用同一種構圖）\n"
     "每個面向都要有具體內容，不要籠統帶過。不想分享照片就把這個欄位填 null。\n"
+    "schedule_override_type／schedule_override_text：只有在翔明確提到要調整作息時才填寫"
+    "（例如「今晚熬夜到兩點」「以後週三都晚點睡」），其他情況兩個欄位都填 null。"
+    "type 填 \"today\"（只影響今天）或 \"recurring\"（持續性調整），"
+    "text 用一句話描述調整內容即可，不用結構化格式。\n"
     "以上這些技術段落使用者都看不到，不用顧慮角色語氣，直接客觀描述即可。"
 )
 
@@ -73,9 +78,16 @@ def build_user_content(text: str, image_urls: list[str]):
 
 
 def build_base_system_messages(
-    bot_memory: str, current_state: str, now: datetime | None = None
+    bot_memory: str,
+    current_state: str,
+    now: datetime | None = None,
+    last_interaction_time: datetime | None = None,
 ) -> list[dict]:
-    """人設 + 長期記憶 + 現況小抄 + 時間感知，供正常回覆與主動發訊共用。"""
+    """人設 + 長期記憶 + 現況小抄 + 時間感知，供正常回覆與主動發訊共用。
+
+    last_interaction_time 有給的話，會額外注入「距離上次互動過了多久」，
+    讓時間感知不只是「現在幾點」，也包含「這段對話中斷了多久」。
+    """
     now = now or now_taipei()
     status = get_schedule_status(now)
 
@@ -92,14 +104,25 @@ def build_base_system_messages(
         "content": f"【目前持續中的狀態】\n{current_state}",
     })
 
-    messages.append({
-        "role": "system",
-        "content": (
-            f"【目前時間感知】現在是{WEEKDAY_NAMES[now.weekday()]} {now.strftime('%H:%M')}，"
-            f"依照平常作息，這個時段通常是：{status.label}。"
-            "回覆的語氣長短可以自然反映這個時段的狀態，不用刻意提起。"
-        ),
-    })
+    time_awareness = (
+        f"【目前時間感知】現在是{WEEKDAY_NAMES[now.weekday()]} {now.strftime('%H:%M')}，"
+        f"依照平常作息，這個時段通常是：{status.label}。"
+        "回覆的語氣長短可以自然反映這個時段的狀態，不用刻意提起。"
+    )
+    if last_interaction_time is not None:
+        elapsed = format_elapsed(last_interaction_time, now)
+        time_awareness += f"\n距離上次互動已經過了約{elapsed}。"
+    messages.append({"role": "system", "content": time_awareness})
+
+    override_text = schedule_override.get_active_override_text()
+    if override_text:
+        messages.append({
+            "role": "system",
+            "content": (
+                f"【目前生效的作息調整，覆蓋預設作息】\n{override_text}\n"
+                "回覆時依照這個調整過的作息判斷現在的狀態，而不是原本的預設時段。"
+            ),
+        })
 
     return messages
 
@@ -108,18 +131,47 @@ def output_format_system_message() -> dict:
     return {"role": "system", "content": _OUTPUT_FORMAT_INSTRUCTIONS}
 
 
+def long_silence_note(elapsed_label: str) -> str:
+    """距離上次互動過了很久之後的 catch-up 提示，跟「剛結束忙碌時段」是同一種
+
+    「給提示、不強制」的注入模式：明確告訴 LLM 這是隔了很久之後重新開始的對話，
+    不用執著在沉默前的舊話題，語氣也可以自然轉換，而不是被 context 慣性卡住。
+    """
+    return (
+        f"【隔了一段時間才繼續對話】距離上次互動已經過了約{elapsed_label}，"
+        "這不是接續剛才的話題，是隔了一段時間後重新開始的對話。"
+        "不需要執著在沉默前的舊話題，語氣也可以自然轉換，依照現在的心情、狀態自然回應即可。"
+    )
+
+
 def build_messages(
     history: list[dict],
     bot_memory: str,
     current_state: str,
     user_content,
     catch_up_note: str | None = None,
+    last_interaction_time: datetime | None = None,
+    now: datetime | None = None,
 ) -> list[dict]:
-    """組出這次要送給 API 的完整 messages：base system + catch-up + 輸出格式 + 歷史 + 這輪訊息。"""
-    messages = build_base_system_messages(bot_memory, current_state)
+    """組出這次要送給 API 的完整 messages：base system + catch-up + 輸出格式 + 歷史 + 這輪訊息。
+
+    catch_up_note（忙碌時段結束）跟長時間沉默提示可能同時成立，兩者都給、
+    不互斥；呼叫端決定 catch_up_note 內容，這裡只負責在滿足時數門檻時
+    額外附加長時間沉默提示。
+    """
+    now = now or now_taipei()
+    messages = build_base_system_messages(
+        bot_memory, current_state, now, last_interaction_time
+    )
 
     if catch_up_note:
         messages.append({"role": "system", "content": catch_up_note})
+
+    if last_interaction_time is not None:
+        elapsed_hours = (now - last_interaction_time).total_seconds() / 3600
+        if elapsed_hours >= config.LONG_SILENCE_HOURS:
+            elapsed_label = format_elapsed(last_interaction_time, now)
+            messages.append({"role": "system", "content": long_silence_note(elapsed_label)})
 
     messages.append(output_format_system_message())
     messages.extend(history)
@@ -128,12 +180,16 @@ def build_messages(
 
 
 def build_proactive_check_messages(
-    history: list[dict], bot_memory: str, current_state: str, now: datetime | None = None
+    history: list[dict],
+    bot_memory: str,
+    current_state: str,
+    now: datetime | None = None,
+    last_interaction_time: datetime | None = None,
 ) -> list[dict]:
     """組出「主動發訊檢查」用的 messages：跟正常回覆共用人設/記憶/狀態/時間感知，
     但沒有使用者這輪的訊息，改成一段系統說明，讓她自己判斷這個當下想不想主動開口。
     """
-    messages = build_base_system_messages(bot_memory, current_state, now)
+    messages = build_base_system_messages(bot_memory, current_state, now, last_interaction_time)
 
     messages.append({
         "role": "system",

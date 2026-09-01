@@ -5,6 +5,11 @@
 時間一律使用 Asia/Taipei（zoneinfo），不再依賴執行主機的系統時區——
 原本用 datetime.now() 在本地筆電（台北時區）沒問題，但如果之後搬到雲端主機
 且系統時區非 UTC+8，作息判斷會整組跑掉。
+
+作息覆寫（schedule_override）生效時，當天一律不做硬性阻擋——覆寫內容是
+自由文字（例如「熬夜到兩點」），程式無法可靠解析出精確時刻，索性只要
+今天有任何生效中的覆寫，就整段解除阻擋，語氣交給 LLM 依 prompt 裡的
+覆寫說明自行判斷（簡單但較粗，之後真的需要精確時刻再升級為結構化欄位）。
 """
 
 from __future__ import annotations
@@ -41,12 +46,22 @@ def get_schedule_status(now: datetime | None = None) -> ScheduleStatus:
     hour = now.hour + now.minute / 60
     weekday = now.weekday()  # 0=週一 ... 6=週日
 
+    # 函式內 import：schedule_override 會 from schedule import now_taipei，
+    # 放在模組頂部會形成循環 import。Python 對 import 有 cache，
+    # 放函式內不影響效能，只是每次呼叫多一次查表。
+    import schedule_override
+    override_active = schedule_override.get_active_override_text() is not None
+
     if config.SLEEP_START_HOUR <= hour < config.WAKE_HOUR:
         available_at = now.replace(hour=config.WAKE_HOUR, minute=0, second=0, microsecond=0)
+        if override_active:
+            return ScheduleStatus(False, "sleep", "作息有調整，非預設睡覺時段", None)
         return ScheduleStatus(True, "sleep", "睡覺中", available_at)
 
     if config.GYM_START_HOUR <= hour < config.GYM_END_HOUR:
         available_at = now.replace(hour=config.GYM_END_HOUR, minute=0, second=0, microsecond=0)
+        if override_active:
+            return ScheduleStatus(False, "gym", "作息有調整，非預設健身時段", None)
         return ScheduleStatus(True, "gym", "健身中", available_at)
 
     if weekday < 5 and config.WAKE_HOUR <= hour < config.GYM_START_HOUR:
