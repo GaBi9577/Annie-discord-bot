@@ -16,7 +16,8 @@ import asyncio
 import io
 import logging
 import random
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import discord
 
@@ -26,8 +27,24 @@ from prompt_builder import build_proactive_check_messages
 from llm_client import chat_completion
 from response_parser import parse_response, RESPONSE_JSON_SCHEMA
 from image_gen import generate_image
+import interaction_log
+import schedule_override
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ProactiveObservability:
+    """目前主動發訊迴圈的可觀測狀態，供 /狀態 類指令讀取，不影響迴圈本身邏輯。"""
+    backoff_multiplier: int = 1
+    last_check_at: datetime | None = None
+    next_check_at: datetime | None = None
+    paused: bool = False
+    # /annie_pause 設 True 時，proactive_loop 仍照常醒來計時，但跳過實際判斷與發訊，
+    # 這樣 /annie_resume 後不需要額外邏輯重啟迴圈，只是單純的旗標檢查（KISS）。
+
+
+observability = ProactiveObservability()
 
 
 def should_attempt_proactive(session, now: datetime) -> bool:
@@ -78,6 +95,7 @@ async def attempt_proactive_message(user_id, session, memory_manager, state_hold
             history=session.history,
             bot_memory=memory_manager.bot_memory,
             current_state=state_holder.value,
+            last_interaction_time=session.last_interaction_time,
         )
 
         try:
@@ -99,6 +117,11 @@ async def attempt_proactive_message(user_id, session, memory_manager, state_hold
             image_bytes = await generate_image(parsed.image_prompt)
 
         logger.info("主動發訊：%s", parsed.reply)
+        interaction_log.append_entry(
+            kind="主動發訊",
+            reply=parsed.reply,
+            image_prompt=parsed.image_prompt,
+        )
         try:
             if image_bytes:
                 discord_file = discord.File(io.BytesIO(image_bytes), filename="annie.png")
@@ -113,6 +136,11 @@ async def attempt_proactive_message(user_id, session, memory_manager, state_hold
 
         if parsed.state:
             state_holder.update(parsed.state)
+
+        if parsed.schedule_override_type == "recurring":
+            schedule_override.write_recurring_override(parsed.schedule_override_text)
+        elif parsed.schedule_override_type == "today":
+            schedule_override.write_today_override(parsed.schedule_override_text)
 
         memory_manager.append_turn(session, None, parsed.reply)
         session.last_interaction_time = now_taipei()
@@ -134,9 +162,16 @@ async def proactive_loop(client, sessions, memory_manager, state_holder) -> None
             config.PROACTIVE_CHECK_INTERVAL_MIN_MINUTES,
             config.PROACTIVE_CHECK_INTERVAL_MAX_MINUTES,
         ) * backoff_multiplier
+        observability.backoff_multiplier = backoff_multiplier
+        observability.next_check_at = now_taipei() + timedelta(minutes=wait_minutes)
         await asyncio.sleep(wait_minutes * 60)
 
         now = now_taipei()
+        observability.last_check_at = now
+
+        if observability.paused:
+            continue  # 已暫停：照常計時醒來，但不做任何判斷或發訊
+
         status = get_schedule_status(now)
         if status.blocking:
             continue  # 睡覺／健身時段不主動；其他時段（含上課中）都可能觸發

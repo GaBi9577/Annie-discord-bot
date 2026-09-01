@@ -24,6 +24,9 @@ from image_gen import generate_image
 from memory import MemoryManager
 from state import CurrentStateHolder
 from proactive import proactive_loop
+import interaction_log
+import schedule_override
+import status_commands
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,12 +34,16 @@ logger = logging.getLogger(__name__)
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
 
 sessions = SessionManager()
 memory_manager = MemoryManager()
 state_holder = CurrentStateHolder()
 
+status_commands.register_commands(tree, sessions, memory_manager, state_holder)
+
 _proactive_task: asyncio.Task | None = None
+_commands_synced = False
 
 
 def extract_image_urls(message: discord.Message) -> list[str]:
@@ -51,13 +58,20 @@ def extract_image_urls(message: discord.Message) -> list[str]:
 async def on_ready():
     logger.info("Bot 已上線：%s", client.user)
 
-    global _proactive_task
+    global _proactive_task, _commands_synced
     # Discord reconnect 會再次觸發 on_ready；只在 loop 還沒啟動、或前一個已經
     # 結束（例如例外導致退出）時才建立新的，避免同時存在多個 proactive loop。
     if _proactive_task is None or _proactive_task.done():
         _proactive_task = client.loop.create_task(
             proactive_loop(client, sessions, memory_manager, state_holder)
         )
+
+    if not _commands_synced:
+        # 斜線指令 sync 有 rate limit，只在真正第一次啟動時做一次；
+        # reconnect 不會重新 sync（指令定義沒變，不需要）。
+        await tree.sync()
+        _commands_synced = True
+        logger.info("斜線指令已同步")
 
     memory_manager.start_worker()
 
@@ -137,6 +151,7 @@ async def wait_then_reply(
         current_state=state_holder.value,
         user_content=user_content,
         catch_up_note=catch_up_note,
+        last_interaction_time=session.last_interaction_time,
     )
 
     # 關鍵段落（呼叫 LLM → 送出）要拿到 session 的鎖才能跑，避免跟同一個
@@ -159,6 +174,12 @@ async def wait_then_reply(
             image_bytes = await generate_image(parsed.image_prompt)
 
         logger.info("回傳內容：%s", parsed.reply)
+        interaction_log.append_entry(
+            kind="一般回覆",
+            reply=parsed.reply,
+            user_message=merged_text or None,
+            image_prompt=parsed.image_prompt,
+        )
 
         if image_bytes:
             discord_file = discord.File(io.BytesIO(image_bytes), filename="annie.png")
@@ -170,6 +191,11 @@ async def wait_then_reply(
             state_holder.update(parsed.state)
         else:
             logger.warning("模型沒有依格式輸出現況小抄，本輪狀態維持不變")
+
+        if parsed.schedule_override_type == "recurring":
+            schedule_override.write_recurring_override(parsed.schedule_override_text)
+        elif parsed.schedule_override_type == "today":
+            schedule_override.write_today_override(parsed.schedule_override_text)
 
         memory_manager.append_turn(session, user_content, parsed.reply)
         session.last_interaction_time = now_taipei()
