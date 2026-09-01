@@ -23,6 +23,8 @@ class ParsedResponse:
     reply: str
     state: str | None
     image_prompt: str | None
+    schedule_override_type: str | None = None  # "recurring" | "today" | None
+    schedule_override_text: str | None = None
 
 
 RESPONSE_JSON_SCHEMA = {
@@ -57,8 +59,28 @@ RESPONSE_JSON_SCHEMA = {
                         "合併成一段逗號分隔的描述，不要加類別標籤。不想分享照片就填 null。"
                     ),
                 },
+                "schedule_override_type": {
+                    "type": ["string", "null"],
+                    "enum": ["recurring", "today", None],
+                    "description": (
+                        "只有在翔明確提到要調整作息安排時才填寫，其他情況一律填 null。"
+                        "\"recurring\" 表示這是持續性的常態調整（例如以後週三都晚點睡）；"
+                        "\"today\" 表示只影響今天的臨時變化（例如今晚熬夜到兩點）。"
+                    ),
+                },
+                "schedule_override_text": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "搭配 schedule_override_type 使用，用一句話描述調整內容"
+                        "（例如「熬夜到凌晨兩點才睡」），純文字即可，不用結構化格式。"
+                        "schedule_override_type 為 null 時，這裡也填 null。"
+                    ),
+                },
             },
-            "required": ["reply", "state", "image_prompt"],
+            "required": [
+                "reply", "state", "image_prompt",
+                "schedule_override_type", "schedule_override_text",
+            ],
             "additionalProperties": False,
         },
     },
@@ -100,4 +122,20 @@ def parse_response(raw_json_text: str) -> ParsedResponse:
     image_prompt = data.get("image_prompt")
     image_prompt = image_prompt.strip() if isinstance(image_prompt, str) and image_prompt.strip() else None
 
-    return ParsedResponse(reply=reply, state=state, image_prompt=image_prompt)
+    override_type = data.get("schedule_override_type")
+    override_type = override_type if override_type in ("recurring", "today") else None
+
+    override_text = data.get("schedule_override_text")
+    override_text = override_text.strip() if isinstance(override_text, str) and override_text.strip() else None
+
+    if override_type and not override_text:
+        logger.warning("模型標記了 schedule_override_type 但沒給內容，忽略這次覆寫")
+        override_type = None
+
+    return ParsedResponse(
+        reply=reply,
+        state=state,
+        image_prompt=image_prompt,
+        schedule_override_type=override_type,
+        schedule_override_text=override_text if override_type else None,
+    )
