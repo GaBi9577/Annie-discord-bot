@@ -452,6 +452,15 @@ class TestAttemptProactiveMessageReturnValue:
         assert failed is False
 
 
+class _NonBlockingStatus:
+    """固定回傳非阻擋狀態的假 ScheduleStatus，供 backoff 測試使用，
+    避免測試結果受「執行當下的真實時間」影響。"""
+    blocking = False
+    reason = None
+    label = "測試用非阻擋時段"
+    available_at = None
+
+
 class TestProactiveLoopBackoff:
     """P1-2：連續 LLM 失敗要放大等待間隔（封頂），成功一次就重置回原本間隔。"""
 
@@ -493,6 +502,10 @@ class TestProactiveLoopBackoff:
         monkeypatch.setattr(random, "uniform", lambda a, b: a)
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
+        # 固定為非阻擋時段，避免測試結果受「執行當下的真實時間」影響——
+        # proactive_loop 在睡覺／健身時段會直接 continue，跳過整輪判斷。
+        monkeypatch.setattr("proactive.get_schedule_status", lambda now: _NonBlockingStatus())
+
         # should_attempt_proactive 恆回傳 True，但讓 attempt_proactive_message
         # 直接模擬失敗/成功交替，不需要真的跑 LLM 呼叫路徑
         monkeypatch.setattr("proactive.should_attempt_proactive", lambda s, now: True)
@@ -531,6 +544,7 @@ class TestProactiveLoopBackoff:
 
         monkeypatch.setattr(random, "uniform", lambda a, b: a)
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr("proactive.get_schedule_status", lambda now: _NonBlockingStatus())
         monkeypatch.setattr("proactive.should_attempt_proactive", lambda s, now: True)
 
         async def fake_attempt_always_fails(user_id, session, memory_manager, state_holder):
