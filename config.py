@@ -32,6 +32,11 @@ SYSTEM_PROMPT_PATH = "annie/persona.md"  # 人設本體(文字互動用)
 PIC_PROMPT_PATH = "annie/pic_prompt.md"  # 外觀描述(圖片生成用)加在圖片生成 prompt 前面(未接 LoRA)
 FEW_SHOT_PATH = "annie/few_shot.md"
 
+SCHEDULE_OVERRIDE_PATH = "annie/schedule_override.md"
+# 作息覆寫檔案，由 bot 自己判斷並寫入(不是手動維護)。
+# 分「常態調整」(持續套用直到被覆寫)與「今日突發」(只影響當天，過期自動失效)兩段，
+# 純文字描述、不做巢狀結構——交給 LLM 自己讀文字判斷，不用寫時間解析邏輯(KISS)。
+
 # --- 記憶 ---
 MAX_HISTORY_MESSAGES = 10
 BOT_MEMORY_PATH = "bot_mem.md"
@@ -45,6 +50,9 @@ BOT_MEMORY_MAX_CHARS = 4000
 # 避免長期累積下 prompt token 成本無限增加
 
 CURRENT_STATE_PATH = "current_state.md"  # 現況小抄：短期內持續變動的狀態(情緒/動作/身體狀態等)
+
+INTERACTION_LOG_PATH = "interaction_log.md"
+# 每輪回覆(一般回覆／主動發訊)都會 append 一筆進這個檔案，供 /狀態 類指令與人工查閱
 
 # --- 對話行為 ---
 REPLY_DELAY = 2  # 秒，訊息緩衝等待時間
@@ -61,6 +69,7 @@ IMAGE_PROVIDER = "nanogpt"  # "nanogpt" | "pixai"，要切換就改這個值，�
 
 # --- 圖片生成(NanoGPT，備案為本機 SDXL Turbo，待筆電空間足夠再切換)---
 NANOGPT_IMAGE_URL = "https://nano-gpt.com/v1/images/generations"
+NANOGPT_BALANCE_URL = "https://nano-gpt.com/api/check-balance"
 IMAGE_MODEL = image_model  # 模型 ID 請對照 NanoGPT 圖片模型列表確認
 IMAGE_RESOLUTION = "1088x1920"  # 對應 9:16 直式構圖，用 API 參數硬性指定，比純文字提示可靠
 
@@ -84,3 +93,8 @@ NO_PROACTIVE_TOKEN = "NO_PROACTIVE"        # LLM 判斷這次不想主動發訊�
 
 PROACTIVE_BACKOFF_MULTIPLIER = 2           # 主動發訊呼叫 LLM 失敗後，下次等待間隔的放大倍率
 PROACTIVE_BACKOFF_MAX_MULTIPLIER = 8       # 放大倍率上限(避免失敗一直持續下去，等待時間無限拉長)
+
+# --- 時間觀念(長時間沉默後的回覆語氣提示)---
+LONG_SILENCE_HOURS = 10
+# 距離上次互動超過這個時數，下次回覆前額外注入提示，讓語氣與話題不用死盯著
+# 沉默前的上一個話題不放；沿用跟「剛結束忙碌時段」相同的 catch-up 提示模式(DRY)
